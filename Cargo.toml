@@ -1,0 +1,57 @@
+[package]
+name = "desert-photos"
+version = "0.1.0"
+edition = "2024"
+description = "A private local photo library built with DesertUI"
+license = "MIT"
+autobenches = false
+
+[features]
+default = ["native-ui", "remote", "apple-photos"]
+native-ui = ["dep:desert-ui", "dep:gpui", "dep:gpui-component"]
+remote = ["dep:reqwest", "dep:reqwest_dav", "dep:tokio", "dep:roxmltree", "dep:keyring"]
+apple-photos = []
+
+[[bin]]
+name = "desert-photos"
+path = "src/main.rs"
+required-features = ["native-ui"]
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+desert-ui = { path = "../DesertUI", version = "0.1.0", optional = true }
+directories = "6"
+gpui = { version = "=0.2.2", optional = true }
+gpui-component = { version = "=0.5.1", optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "tiff", "bmp"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"], optional = true }
+reqwest_dav = { version = "=0.3.3", default-features = false, features = ["rustls-tls"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time"], optional = true }
+roxmltree = { version = "0.21", optional = true }
+keyring = { version = "3.6", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6", features = ["apple-native"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6", features = ["windows-native"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6", features = ["linux-native"], optional = true }
+
+[dev-dependencies]
+gpui = { version = "=0.2.2", features = ["test-support"] }
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+lto = "thin"
+strip = true
