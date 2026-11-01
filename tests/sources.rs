@@ -234,6 +234,10 @@ mod remote {
                             continue;
                         }
                     };
+                    // The listener polls nonblocking, but each accepted HTTP
+                    // connection uses blocking BufRead/write_all. Inheriting a
+                    // nonblocking socket can truncate headers or a response.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
@@ -274,12 +278,13 @@ mod remote {
                     };
                     let (status, body) = handler(&request);
                     r.lock().unwrap().push(request);
-                    let _ = write!(
+                    write!(
                         stream,
                         "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
-                    );
-                    let _ = stream.write_all(&body);
+                    )
+                    .unwrap();
+                    stream.write_all(&body).unwrap();
                 }
             });
             Self {

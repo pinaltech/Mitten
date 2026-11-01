@@ -21,6 +21,14 @@ impl<T> BoundedCache<T> {
             order: VecDeque::new(),
         }
     }
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity.max(1);
+        while self.values.len() > self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.values.remove(&old);
+            }
+        }
+    }
     pub fn peek(&self, key: &str) -> Option<&T> {
         self.values.get(key)
     }

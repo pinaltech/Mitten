@@ -1,5 +1,51 @@
 # Verification
 
+## Catalog stability, interactive zoom and disappearing thumbnails — October 31, 2026
+
+- **38 tests pass:** six geometry/cache tests, twelve GPUI tests, one PhotoKit
+  packaging regression, eight source/protocol tests and eleven storage tests.
+  Formatting, strict Clippy, macOS compilation/bundling and both privacy-description
+  checks pass. Linux/Windows x86-64 core/adapters and Intel macOS core/adapters/
+  PhotoKit compile checks pass too; these are not native Linux/Windows GUI builds.
+- Reproduced the disappearing-grid bug with a 640 × 1200 dense viewport:
+  **0 of 240 fully visible thumbnails remained ready** with the fixed 96-entry
+  decoded cache. The same regression now retains all 240. It checks cold scroll
+  ranges, zooming, scrolling during a pinch, reversing a settle, returning to the
+  dense level, and scrolling again. No preview or original is requested.
+  Thumbnail path/decode budgets now follow visible rows and active transition
+  slots, with the earlier 256/96 limits as base budgets. Viewer caches stay at
+  three. Cache size depends on viewport work, never total catalog size.
+- Bottom-up rows are packed from the newest end. A partial oldest row absorbs
+  changes in metadata count, keeping the latest photos in the same columns and
+  at the same distance from the bottom. Short libraries also align to the bottom.
+  Real GPUI tests compare newest-photo bounds before/after final-page completion
+  for 3→6, 5→8 and 200→203 photos, including catalog completion during a pinch.
+  There is no layout-mode change when the known count becomes final.
+- Replaced the static crossfade with moving grid-slot frames and independently
+  dissolving contents. The anchor slot keeps its photo, gesture progress drives
+  geometry immediately, and a 224 ms settle completes/cancels the level change.
+  Reversing a settle resumes its current geometry. Scroll, resize and view changes
+  cancel obsolete geometry safely; the underlying grid is always live.
+- The virtual list now supplies the only visible row range; independently sampled
+  offset-based tile culling was removed. Measurements still make no image requests.
+  Transition work is bounded by source/destination viewport slots even for a
+  million-record catalog. Existing million-photo catalog and scroll tests pass.
+- Native review used the generated-JPEG library and isolated profile. Confirmed
+  the full latest row, loaded thumbnails after density changes, bottom-aligned
+  short grids, floating dates and the scrollbar. The isolated review process was
+  stopped after verification. Physical pinch feel and exact
+  equivalence to Apple's Photos remain unverified. Research, design reasoning
+  and the distinction from Apple's private implementation are documented in
+  [GALLERY_TRANSITIONS.md](docs/GALLERY_TRANSITIONS.md).
+- One full run exposed an intermittent truncated localhost HTTP response in the
+  test fixture. Accepted fixture connections now explicitly use blocking I/O,
+  and write failures are asserted. All eight source/protocol tests then passed
+  **ten consecutive runs**. Production networking behavior was not changed.
+
+Earlier fixed-cache limits and static-fade descriptions below are historical and
+superseded by this revision. Live provider accounts, real TCC approval and native
+Linux/Windows GUI execution retain their earlier verification limits.
+
 ## Gallery direction and viewer revision — October 31, 2026
 
 - **34 tests pass:** four geometry/cache tests, ten GPUI interaction tests,

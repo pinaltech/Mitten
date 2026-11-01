@@ -25,6 +25,16 @@ impl PhotoImageCache {
         self.order.clear();
         self.ready.clear();
     }
+    // A viewport can contain more than 96 dense tiles. The working-set budget
+    // must fit every visible image plus a measurement row, or asynchronous loads
+    // repeatedly evict one another before decoding ever completes.
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity.max(1);
+    }
+    #[cfg(test)]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
     pub fn ready(&self, path: &std::path::Path) -> Option<Arc<RenderImage>> {
         self.ready
             .get(&Resource::from(path.to_path_buf()))

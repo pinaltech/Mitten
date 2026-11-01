@@ -802,13 +802,15 @@ fn thumbnail_remains_while_viewer_upgrade_is_not_yet_decoded(cx: &mut TestAppCon
 fn anchor_screen_y(app: &PhotosApp, anchor: &GalleryAnchor, cx: &App) -> f32 {
     let photos = app.visible(cx);
     let index = photos.position(app.photo_index[&anchor.id]).unwrap();
-    let layout = GalleryLayout::new(app.gallery_width, app.gallery_zoom);
+    let layout = GalleryLayout::new(app.gallery_width, app.gallery_zoom)
+        .with_count(app.visible(cx).len(), app.preferences.bottom_to_top);
     layout.cell(index).y
         + anchor.within * layout.edge
         + f32::from(app.scroll.0.borrow().base_handle.offset().y)
 }
 fn assert_at_bottom(app: &PhotosApp, cx: &App) {
-    let layout = GalleryLayout::new(app.gallery_width, app.gallery_zoom);
+    let layout = GalleryLayout::new(app.gallery_width, app.gallery_zoom)
+        .with_count(app.visible(cx).len(), app.preferences.bottom_to_top);
     let h = &app.scroll.0.borrow().base_handle;
     let max = (layout.blocks(app.visible(cx).len()) as f32 * layout.block_height
         - f32::from(h.bounds().size.height))
@@ -1037,4 +1039,236 @@ fn viewer_swipes_settle_once_pan_only_when_zoomed_and_toolbars_frame_image(
         assert_eq!(app.anchor, Some(0));
         assert_eq!(app.swipe_offset, 0.);
     });
+}
+
+fn paint_frames(cx: &mut VisualTestContext, count: usize) {
+    for _ in 0..count {
+        cx.update(|w, cx| {
+            w.refresh();
+            let _ = w.draw(cx);
+        });
+        cx.run_until_parked();
+    }
+}
+
+#[gpui::test]
+fn dense_gallery_keeps_every_visible_thumbnail_decoded_after_zoom_and_scroll(
+    cx: &mut TestAppContext,
+) {
+    cx.update(ui::init);
+    let data = tempfile::tempdir().unwrap();
+    let counters = Arc::new(SourceCounters::default());
+    let driver: Arc<dyn PhotosDriver> = Arc::new(
+        desert_photos::sources::ConnectedPhotos::new(
+            Source {
+                driver: "synthetic".into(),
+                path: data.path().join("source"),
+            },
+            Box::new(StressSource(counters.clone())),
+        )
+        .unwrap(),
+    );
+    let mut entity = None;
+    let window = cx.add_window(|w, cx| {
+        let app = cx.new(|cx| {
+            let mut app = PhotosApp::new(data.path().join("settings.json"), w, cx);
+            app.driver = Some(driver);
+            app.library.photos = synthetic_photos(0..3000);
+            app.library_changed();
+            app.gallery_zoom = 0.;
+            app
+        });
+        entity = Some(app.clone());
+        Root::new(app, w, cx)
+    });
+    let app = entity.unwrap();
+    let cx = VisualTestContext::from_window(window.into(), cx).into_mut();
+    cx.simulate_resize(size(px(640.), px(1200.)));
+    frame(cx);
+    paint_frames(cx, 8);
+    app.read_with(cx, assert_dense_ready);
+    app.update_in(cx, |app, _, cx| {
+        app.scroll.scroll_to_item(140, ScrollStrategy::Top);
+        cx.notify();
+    });
+    frame(cx);
+    paint_frames(cx, 8);
+    app.read_with(cx, assert_dense_ready);
+    let pointer = bounds(cx, "photo-grid").center();
+    app.update_in(cx, |app, _, cx| {
+        app.pinch_gallery(0.55, pointer, false, cx);
+        assert!((app.gallery_motion.as_ref().unwrap().progress - 0.55).abs() < 0.001);
+    });
+    paint_frames(cx, 2);
+    assert!(cx.debug_bounds("gallery-motion").is_some());
+    // Scroll interrupts an active pinch; the real virtual grid must remain live.
+    cx.simulate_event(ScrollWheelEvent {
+        position: pointer,
+        delta: ScrollDelta::Pixels(point(px(0.), px(-80.))),
+        touch_phase: TouchPhase::Started,
+        ..Default::default()
+    });
+    frame(cx);
+    app.read_with(cx, |app, _| {
+        assert!(app.gallery_motion.is_none());
+        assert!(app.gallery_pinch.is_none());
+    });
+    app.update_in(cx, |app, _, cx| app.pinch_gallery(0.7, pointer, true, cx));
+    cx.run_until_parked();
+    for _ in 0..5 {
+        cx.executor().advance_clock(Duration::from_millis(16));
+        paint_frames(cx, 1);
+    }
+    app.update_in(cx, |app, _, cx| {
+        let before = app.gallery_motion.as_ref().unwrap().progress;
+        app.pinch_gallery(-0.15, pointer, false, cx);
+        let after = app.gallery_motion.as_ref().unwrap().progress;
+        assert!(
+            (before - after - 0.15).abs() < 0.001,
+            "reversing a settling pinch must resume the visible frame"
+        );
+        app.pinch_gallery(0., pointer, true, cx);
+    });
+    advance_gallery_animation(cx);
+    app.read_with(cx, |app, _| assert!(app.gallery_motion.is_none()));
+    app.update_in(cx, |app, _, cx| {
+        app.zoom_gallery(-app.gallery_zoom, pointer, cx)
+    });
+    advance_gallery_animation(cx);
+    paint_frames(cx, 8);
+    app.read_with(cx, assert_dense_ready);
+    app.update_in(cx, |app, _, cx| {
+        app.scroll.scroll_to_item(20, ScrollStrategy::Top);
+        cx.notify();
+    });
+    frame(cx);
+    paint_frames(cx, 8);
+    app.read_with(cx, assert_dense_ready);
+    app.read_with(cx, |app, cx| {
+        assert!(app.thumbnails.len() <= app.render_cache.read(cx).capacity().max(THUMBNAIL_CACHE))
+    });
+    use std::sync::atomic::Ordering::SeqCst;
+    assert_eq!(counters.previews.load(SeqCst), 0);
+    assert_eq!(counters.originals.load(SeqCst), 0);
+}
+
+fn advance_gallery_animation(cx: &mut VisualTestContext) {
+    cx.run_until_parked();
+    for _ in 0..18 {
+        cx.executor().advance_clock(Duration::from_millis(16));
+        cx.run_until_parked();
+    }
+    frame(cx);
+}
+
+fn assert_dense_ready(app: &PhotosApp, cx: &App) {
+    let view = app.visible(cx);
+    let layout = GalleryLayout::new(app.gallery_width, app.gallery_zoom)
+        .with_count(app.visible(cx).len(), app.preferences.bottom_to_top);
+    let handle = &app.scroll.0.borrow().base_handle;
+    let offset = f32::from(-handle.offset().y);
+    let height = f32::from(handle.bounds().size.height);
+    let first = (offset / layout.block_height).ceil() as usize * layout.block_len;
+    let last = (((offset + height) / layout.block_height).floor() as usize * layout.block_len)
+        .min(view.len());
+    assert!(
+        last - first > 96,
+        "test must exceed the old decoded-cache capacity"
+    );
+    assert!(app.render_cache.read(cx).capacity() >= last - first);
+    assert!(app.render_cache.read(cx).len() <= app.render_cache.read(cx).capacity());
+    let ready = (first..last)
+        .filter(|&i| {
+            let p = view.get(&app.library, i).unwrap();
+            app.thumbnails
+                .peek(&p.fingerprint)
+                .and_then(|path| app.render_cache.read(cx).ready(path))
+                .is_some()
+        })
+        .count();
+    assert_eq!(
+        ready,
+        last - first,
+        "all visible thumbnails must stay decoded, not evict each other"
+    );
+}
+
+#[gpui::test]
+fn final_catalog_page_keeps_latest_photo_frames_fixed_and_waits_for_pinch(cx: &mut TestAppContext) {
+    cx.update(ui::init);
+    for (initial, before_id, after_id) in [
+        (3, "photo-tile-2", "photo-tile-5"),
+        (5, "photo-tile-4", "photo-tile-7"),
+        (200, "photo-tile-199", "photo-tile-202"),
+    ] {
+        let data = tempfile::tempdir().unwrap();
+        let counters = Arc::new(SourceCounters::default());
+        counters
+            .total
+            .store(initial + 3, std::sync::atomic::Ordering::SeqCst);
+        let driver: Arc<dyn PhotosDriver> = Arc::new(
+            desert_photos::sources::ConnectedPhotos::new(
+                Source {
+                    driver: "synthetic".into(),
+                    path: data.path().join("source"),
+                },
+                Box::new(StressSource(counters)),
+            )
+            .unwrap(),
+        );
+        let mut entity = None;
+        let window = cx.add_window(|w, cx| {
+            let app = cx.new(|cx| {
+                let mut app = PhotosApp::new(data.path().join("settings.json"), w, cx);
+                app.library.photos = synthetic_photos(0..initial);
+                app.driver = Some(driver);
+                app.total = Some(initial + 3);
+                app.next_page = Some(initial.to_string());
+                app.has_more = true;
+                app.library_changed();
+                app
+            });
+            entity = Some(app.clone());
+            Root::new(app, w, cx)
+        });
+        let app = entity.unwrap();
+        let cx = VisualTestContext::from_window(window.into(), cx).into_mut();
+        cx.simulate_resize(size(px(1060.), px(700.)));
+        frame(cx);
+        let before = cx.debug_bounds(before_id).unwrap();
+        let pointer = bounds(cx, "photo-grid").center();
+        app.update_in(cx, |app, _, cx| {
+            app.pinch_gallery(0.3, pointer, false, cx);
+            app.load_more(cx);
+        });
+        frame(cx);
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.library.photos.len(), initial);
+            assert!(app.gallery_motion.is_some());
+        });
+        app.update_in(cx, |app, _, cx| app.pinch_gallery(0., pointer, true, cx));
+        advance_gallery_animation(cx);
+        frame(cx);
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.library.photos.len(), initial + 3);
+            assert!(!app.has_more);
+            assert!(app.gallery_motion.is_none());
+        });
+        let after = cx.debug_bounds(after_id).unwrap();
+        assert!(
+            (before.origin.x - after.origin.x).abs() < px(1.),
+            "latest photo changed column at catalog completion"
+        );
+        assert!(
+            (before.origin.y - after.origin.y).abs() < px(1.),
+            "latest photo dropped a row at catalog completion"
+        );
+        assert_eq!(before.size, after.size);
+        // A resize during another pinch must cancel the old geometry, not retain a
+        // surface tied to the old viewport and stale scroll metrics.
+        app.update_in(cx, |app, _, cx| app.pinch_gallery(0.6, pointer, false, cx));
+        cx.simulate_resize(size(px(720.), px(620.)));
+        frame(cx);
+        app.read_with(cx, |app, _| assert!(app.gallery_motion.is_none()));
+    }
 }

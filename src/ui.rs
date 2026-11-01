@@ -1,4 +1,4 @@
-use desert_photos::gallery::GalleryLayout;
+use desert_photos::gallery::{FramePair, GalleryLayout, GridFrame};
 use desert_photos::loading::{BoundedCache, THUMBNAIL_CACHE, THUMBNAIL_JOBS, VIEWER_CACHE};
 use desert_photos::sources::{Connection, PhotoPage, ProviderKind};
 use desert_photos::storage::{self, Library, Photo, PhotosDriver, Preferences, Source};
@@ -130,9 +130,20 @@ struct GalleryAnchor {
     screen: f32,
     end: bool,
 }
-struct GalleryFade {
-    images: Vec<(Arc<RenderImage>, f32, f32, f32)>,
+struct MotionTile {
+    frames: FramePair,
+    source: Option<Arc<Photo>>,
+    target: Option<Arc<Photo>>,
+    source_image: Option<Arc<RenderImage>>,
+    target_image: Option<Arc<RenderImage>>,
+}
+struct GalleryMotion {
+    from: GridFrame,
+    to: GridFrame,
+    tiles: Arc<Vec<MotionTile>>,
+    progress: f32,
     epoch: u64,
+    settling: bool,
 }
 struct VisibleCache {
     revision: u64,
@@ -181,13 +192,14 @@ pub struct PhotosApp {
     inspector: bool,
     gallery_zoom: f32,
     gallery_width: f32,
+    gallery_height: f32,
     gallery_period: String,
     gallery_reset: bool,
     gallery_restore: Option<GalleryAnchor>,
     gallery_pinch: Option<f32>,
     gallery_pinch_epoch: u64,
-    gallery_fade: Option<GalleryFade>,
-    gallery_fade_epoch: u64,
+    gallery_motion: Option<GalleryMotion>,
+    gallery_motion_epoch: u64,
     swipe_offset: f32,
     swipe_active: bool,
     swipe_epoch: u64,
@@ -326,13 +338,14 @@ impl PhotosApp {
             inspector: false,
             gallery_zoom: 2.,
             gallery_width: 844.,
+            gallery_height: 0.,
             gallery_period: String::new(),
             gallery_reset: true,
             gallery_restore: None,
             gallery_pinch: None,
             gallery_pinch_epoch: 0,
-            gallery_fade: None,
-            gallery_fade_epoch: 0,
+            gallery_motion: None,
+            gallery_motion_epoch: 0,
             swipe_offset: 0.,
             swipe_active: false,
             swipe_epoch: 0,
@@ -836,6 +849,9 @@ impl PhotosApp {
                 }
                 Ok::<_,anyhow::Error>(combined)
             }).await;
+            while this.update(cx,|this,_| generation==this.generation && epoch==this.catalog_epoch && this.gallery_motion.is_some()).unwrap_or(false) {
+                cx.background_executor().timer(Duration::from_millis(16)).await;
+            }
             let _ = this.update(cx, |this, cx| {
                 if generation != this.generation || epoch != this.catalog_epoch { return; }
                 this.loading = false;
@@ -1103,6 +1119,9 @@ impl PhotosApp {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if double {
+            self.cancel_gallery_interaction();
+        }
         let visible = self.visible(cx);
         let Some(photo) = visible.get(&self.library, index).cloned() else {
             return;
@@ -1147,6 +1166,7 @@ impl PhotosApp {
         if self.modal.is_some() {
             return;
         }
+        self.cancel_gallery_interaction();
         if let Some(photo) = self.current() {
             self.selected = BTreeSet::from([photo.id.clone()]);
             self.viewer = Some(photo.id.clone());
@@ -1351,7 +1371,8 @@ impl PhotosApp {
         let photos = self.visible(cx);
         self.selected = base;
         for (i, photo) in photos.iter(&self.library).enumerate() {
-            let layout = GalleryLayout::new(self.gallery_width, self.gallery_zoom);
+            let layout = GalleryLayout::new(self.gallery_width, self.gallery_zoom)
+                .with_count(self.visible(cx).len(), self.preferences.bottom_to_top);
             let cell = layout.cell(i);
             let x = px(cell.x);
             let y = px(cell.y);
@@ -1956,10 +1977,24 @@ impl PhotosApp {
                     }),
             )
     }
+    fn thumbnail_budget(&mut self, layout: GalleryLayout, height: f32, cx: &mut Context<Self>) {
+        let visible =
+            ((height.max(1.) / layout.block_height).ceil() as usize + 3) * layout.block_len;
+        let capacity = visible
+            .max(
+                self.gallery_motion
+                    .as_ref()
+                    .map_or(0, |m| m.tiles.len() * 2 + layout.block_len),
+            )
+            .max(96);
+        self.render_cache
+            .update(cx, |cache, _| cache.set_capacity(capacity));
+        self.thumbnails.set_capacity(capacity.max(THUMBNAIL_CACHE));
+    }
     fn reset_gallery(&mut self) {
         self.gallery_reset = true;
         self.gallery_restore = None;
-        self.gallery_fade = None;
+        self.gallery_motion = None;
         self.gallery_pinch = None;
     }
     fn capture_gallery_anchor(&self, cx: &App) -> Option<GalleryAnchor> {
@@ -1967,7 +2002,8 @@ impl PhotosApp {
         if photos.is_empty() {
             return None;
         }
-        let layout = GalleryLayout::new(self.gallery_width, self.gallery_zoom);
+        let layout = GalleryLayout::new(self.gallery_width, self.gallery_zoom)
+            .with_count(self.visible(cx).len(), self.preferences.bottom_to_top);
         let scroll = &self.scroll.0.borrow().base_handle;
         let height = f32::from(scroll.bounds().size.height);
         let offset = f32::from(-scroll.offset().y).max(0.);
@@ -1988,6 +2024,7 @@ impl PhotosApp {
         })
     }
     fn preserve_gallery(&mut self, cx: &App) {
+        self.cancel_gallery_interaction();
         if !self.gallery_reset
             && self.gallery_restore.is_none()
             && self.scroll.0.borrow().deferred_scroll_to_item.is_none()
@@ -2011,6 +2048,137 @@ impl PhotosApp {
         *self.visible_cache.borrow_mut() = None;
         cx.notify();
     }
+    fn begin_gallery_motion(
+        &mut self,
+        target: f32,
+        pointer: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let photos = self.visible(cx);
+        if photos.is_empty() || target == self.gallery_zoom {
+            return;
+        }
+        let old = GalleryLayout::new(self.gallery_width, self.gallery_zoom)
+            .with_count(photos.len(), self.preferences.bottom_to_top);
+        let next = GalleryLayout::new(self.gallery_width, target)
+            .with_count(photos.len(), self.preferences.bottom_to_top);
+        let (bounds, offset) = {
+            let h = &self.scroll.0.borrow().base_handle;
+            (h.bounds(), f32::from(-h.offset().y).max(0.))
+        };
+        let height = f32::from(bounds.size.height).max(1.);
+        let old_title = if old.full_bleed() { 0. } else { 84. };
+        let new_title = if next.full_bleed() { 0. } else { 84. };
+        let available = self.gallery_height.max(height);
+        let next_available = (available + old_title - new_title).max(1.);
+        let next_height =
+            (next.blocks(photos.len()) as f32 * next.block_height).min(next_available);
+        let from_header = old_title
+            + if self.preferences.bottom_to_top {
+                (available - height).max(0.)
+            } else {
+                0.
+            };
+        let to_header = new_title
+            + if self.preferences.bottom_to_top {
+                (next_available - next_height).max(0.)
+            } else {
+                0.
+            };
+        let local = if bounds.contains(&pointer) {
+            pointer - bounds.origin
+        } else {
+            point(bounds.size.width / 2., bounds.size.height / 2.)
+        };
+        let anchor = old.nearest(local.x.into(), offset + f32::from(local.y), photos.len());
+        let max = (old.blocks(photos.len()) as f32 * old.block_height - height).max(0.);
+        let next_max = (next.blocks(photos.len()) as f32 * next.block_height - next_height).max(0.);
+        let to_offset = if self.preferences.bottom_to_top && max - offset < 2. {
+            next_max
+        } else {
+            old.anchored_offset(
+                &next,
+                (local.x.into(), local.y.into()),
+                offset,
+                photos.len(),
+            )
+            .min(next_max)
+        };
+        let from = GridFrame {
+            layout: old,
+            offset,
+            header: from_header,
+            height,
+        };
+        let to = GridFrame {
+            layout: next,
+            offset: to_offset,
+            header: to_header,
+            height: next_height,
+        };
+        let cache = self.render_cache.read(cx);
+        let image = |photo: &Option<Arc<Photo>>| {
+            photo
+                .as_ref()
+                .and_then(|p| self.thumbnails.peek(&p.fingerprint))
+                .and_then(|path| cache.ready(path))
+        };
+        let tiles = from
+            .slots_to(to, anchor, photos.len())
+            .into_iter()
+            .map(|frames| {
+                let source = frames
+                    .source
+                    .and_then(|i| photos.get(&self.library, i))
+                    .cloned();
+                let target = frames
+                    .target
+                    .and_then(|i| photos.get(&self.library, i))
+                    .cloned();
+                MotionTile {
+                    frames,
+                    source_image: image(&source),
+                    target_image: image(&target),
+                    source,
+                    target,
+                }
+            })
+            .collect();
+        self.gallery_motion_epoch += 1;
+        self.gallery_motion = Some(GalleryMotion {
+            from,
+            to,
+            tiles: Arc::new(tiles),
+            progress: 0.,
+            epoch: self.gallery_motion_epoch,
+            settling: false,
+        });
+        self.gallery_restore = None;
+        self.marquee = None;
+    }
+    fn finish_gallery_motion(&mut self, commit: bool) {
+        if let Some(motion) = self.gallery_motion.take() {
+            let frame = if commit { motion.to } else { motion.from };
+            self.gallery_zoom = frame.layout.zoom;
+            self.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+            self.scroll
+                .0
+                .borrow()
+                .base_handle
+                .set_offset(point(px(0.), px(-frame.offset)));
+            self.gallery_reset = false;
+            self.gallery_restore = None;
+        }
+        self.gallery_motion_epoch += 1;
+    }
+    fn cancel_gallery_interaction(&mut self) {
+        if let Some(motion) = &self.gallery_motion {
+            let commit = motion.progress >= 0.5;
+            self.finish_gallery_motion(commit);
+        }
+        self.gallery_pinch = None;
+        self.gallery_pinch_epoch += 1;
+    }
     fn pinch_gallery(
         &mut self,
         delta: f32,
@@ -2018,12 +2186,54 @@ impl PhotosApp {
         ended: bool,
         cx: &mut Context<Self>,
     ) {
-        if !delta.is_finite() || self.viewer.is_some() || self.modal.is_some() {
+        if !delta.is_finite()
+            || self.viewer.is_some()
+            || self.modal.is_some()
+            || self.driver.is_none()
+        {
             return;
+        }
+        // Grabbing a settling transition resumes its visible geometry, rather than
+        // restarting an animation from an invisible endpoint.
+        if let Some(motion) = &mut self.gallery_motion
+            && motion.settling
+        {
+            motion.settling = false;
+            self.gallery_motion_epoch += 1;
+            motion.epoch = self.gallery_motion_epoch;
+            self.gallery_zoom = motion.from.layout.zoom;
+            self.gallery_pinch = Some(
+                motion.from.layout.zoom
+                    + (motion.to.layout.zoom - motion.from.layout.zoom) * motion.progress,
+            );
         }
         let value = (self.gallery_pinch.unwrap_or(self.gallery_zoom) + delta)
             .clamp(0., GalleryLayout::MAX_ZOOM);
         self.gallery_pinch = Some(value);
+        if let Some(m) = &self.gallery_motion
+            && (value - m.from.layout.zoom) * (m.to.layout.zoom - m.from.layout.zoom) < 0.
+        {
+            self.finish_gallery_motion(false);
+        }
+        if self.gallery_motion.is_none() && (value - self.gallery_zoom).abs() > 0.001 {
+            self.begin_gallery_motion(
+                (self.gallery_zoom + (value - self.gallery_zoom).signum())
+                    .clamp(0., GalleryLayout::MAX_ZOOM),
+                pointer,
+                cx,
+            );
+        }
+        if let Some(m) = &mut self.gallery_motion {
+            m.progress = ((value - m.from.layout.zoom) / (m.to.layout.zoom - m.from.layout.zoom))
+                .clamp(0., 1.);
+        }
+        if self
+            .gallery_motion
+            .as_ref()
+            .is_some_and(|m| m.progress >= 1.)
+        {
+            self.finish_gallery_motion(true);
+        }
         self.gallery_pinch_epoch += 1;
         if ended {
             self.finish_gallery_pinch(pointer, cx);
@@ -2032,7 +2242,7 @@ impl PhotosApp {
         let epoch = self.gallery_pinch_epoch;
         cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(Duration::from_millis(140))
+                .timer(Duration::from_millis(100))
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.gallery_pinch_epoch == epoch {
@@ -2041,11 +2251,70 @@ impl PhotosApp {
             });
         })
         .detach();
+        cx.notify();
     }
     fn finish_gallery_pinch(&mut self, pointer: Point<Pixels>, cx: &mut Context<Self>) {
-        if let Some(target) = self.gallery_pinch.take() {
-            self.zoom_gallery(target.round() - self.gallery_zoom, pointer, cx);
+        if let Some(value) = self.gallery_pinch.take() {
+            if let Some(motion) = &self.gallery_motion {
+                let commit = (value.round() - motion.to.layout.zoom).abs()
+                    < (value.round() - motion.from.layout.zoom).abs();
+                self.settle_gallery_motion(commit, cx);
+            } else {
+                self.zoom_gallery(value.round() - self.gallery_zoom, pointer, cx);
+            }
         }
+    }
+    fn settle_gallery_motion(&mut self, commit: bool, cx: &mut Context<Self>) {
+        let Some(m) = &mut self.gallery_motion else {
+            return;
+        };
+        m.settling = true;
+        self.gallery_motion_epoch += 1;
+        m.epoch = self.gallery_motion_epoch;
+        let epoch = m.epoch;
+        let start = m.progress;
+        let end = if commit { 1. } else { 0. };
+        // Install the final real grid behind the opaque animated surface now, so
+        // its scroll metrics and asynchronous thumbnails are ready at handoff.
+        let frame = if commit { m.to } else { m.from };
+        self.gallery_zoom = frame.layout.zoom;
+        self.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+        self.scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.), px(-frame.offset)));
+        self.gallery_restore = None;
+        self.gallery_reset = false;
+        cx.spawn(async move |this, cx| {
+            for tick in 1..=14 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let keep = this
+                    .update(cx, |this, cx| {
+                        let Some(m) = &mut this.gallery_motion else {
+                            return false;
+                        };
+                        if m.epoch != epoch || !m.settling {
+                            return false;
+                        }
+                        let t = tick as f32 / 14.;
+                        m.progress = start + (end - start) * (1. - (1. - t).powi(3));
+                        if tick == 14 {
+                            this.finish_gallery_motion(commit);
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
     }
     fn zoom_gallery(&mut self, delta: f32, pointer: Point<Pixels>, cx: &mut Context<Self>) {
         if self.driver.is_none()
@@ -2055,70 +2324,145 @@ impl PhotosApp {
         {
             return;
         }
+        if self.gallery_motion.is_some() {
+            let commit = self
+                .gallery_motion
+                .as_ref()
+                .is_some_and(|m| m.progress >= 0.5);
+            self.finish_gallery_motion(commit);
+        }
         let target = (self.gallery_zoom + delta)
             .round()
             .clamp(0., GalleryLayout::MAX_ZOOM);
-        if target == self.gallery_zoom {
-            return;
-        }
-        let old = GalleryLayout::new(self.gallery_width, self.gallery_zoom);
-        let photos = self.visible(cx);
-        let (bounds, offset) = {
-            let h = &self.scroll.0.borrow().base_handle;
-            (h.bounds(), f32::from(-h.offset().y))
-        };
-        let height = f32::from(bounds.size.height);
-        let mut anchor = self.capture_gallery_anchor(cx);
-        if bounds.contains(&pointer)
-            && let Some(a) = &mut anchor
-        {
-            let local = pointer - bounds.origin;
-            let i = old.nearest(local.x.into(), offset + f32::from(local.y), photos.len());
-            if let Some(photo) = photos.get(&self.library, i) {
-                a.id = photo.id.clone();
-                a.fallback = i;
-                a.screen = local.y.into();
-                a.within = ((offset + a.screen - old.cell(i).y) / old.edge).clamp(0., 1.);
+        self.begin_gallery_motion(target, pointer, cx);
+        self.settle_gallery_motion(true, cx);
+    }
+    fn motion_view(&mut self, c: Colors, cx: &mut Context<Self>) -> AnyElement {
+        let m = self.gallery_motion.as_ref().unwrap();
+        let tiles = m.tiles.clone();
+        let progress = m.progress;
+        let from = m.from;
+        let to = m.to;
+        let blend = ((progress - 0.12) / 0.76).clamp(0., 1.);
+        let blend = blend * blend * (3. - 2. * blend);
+        let mut surface = div()
+            .id("gallery-motion")
+            .debug_selector(|| "gallery-motion".into())
+            .absolute()
+            .inset_0()
+            .overflow_hidden()
+            .bg(rgb(c.bg));
+        let header = from.header + (to.header - from.header) * progress;
+        let mut grid = div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .top(px(header))
+            .bottom_0()
+            .overflow_hidden();
+        for (i, tile) in tiles.iter().enumerate() {
+            for photo in [&tile.source, &tile.target].into_iter().flatten() {
+                self.request_image(photo.as_ref().clone(), false, cx);
             }
-        }
-        // Retain only already decoded, on-screen thumbnails during the crossfade.
-        let first = (offset.max(0.) / old.block_height) as usize * old.block_len;
-        let last = (((offset + height) / old.block_height).ceil() as usize * old.block_len)
-            .min(photos.len());
-        let cache = self.render_cache.read(cx);
-        let images = (first..last)
-            .filter_map(|i| {
-                let photo = photos.get(&self.library, i)?;
-                let path = self.thumbnails.peek(&photo.fingerprint)?;
-                let image = cache.ready(path)?;
-                let cell = old.cell(i);
-                Some((
-                    image,
-                    cell.x,
-                    cell.y - offset + if old.full_bleed() { 0. } else { 84. },
-                    cell.edge,
-                ))
-            })
-            .collect();
-        self.gallery_fade_epoch += 1;
-        let epoch = self.gallery_fade_epoch;
-        self.gallery_fade = Some(GalleryFade { images, epoch });
-        self.gallery_zoom = target;
-        self.gallery_restore = anchor;
-        self.marquee = None;
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(180))
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                if this.gallery_fade_epoch == epoch {
-                    this.gallery_fade = None;
-                    cx.notify();
+            let ready = |photo: &Option<Arc<Photo>>| {
+                photo
+                    .as_ref()
+                    .and_then(|p| self.thumbnails.peek(&p.fingerprint))
+                    .and_then(|path| self.render_cache.read(cx).ready(path))
+            };
+            let source = tile.source_image.clone().or_else(|| ready(&tile.source));
+            let target = tile.target_image.clone().or_else(|| ready(&tile.target));
+            let frame = tile.frames.at(progress);
+            let radius = from.layout.radius + (to.layout.radius - from.layout.radius) * progress;
+            let same = tile
+                .source
+                .as_ref()
+                .zip(tile.target.as_ref())
+                .is_some_and(|(a, b)| a.id == b.id);
+            let mut cell = div()
+                .id(("motion-frame", i))
+                .absolute()
+                .left(px(frame.x))
+                .top(px(frame.y - header))
+                .size(px(frame.edge))
+                .rounded(px(radius))
+                .overflow_hidden()
+                .bg(rgb(c.surface));
+            if let Some(image) = source {
+                cell = cell.child(img(image).size_full().object_fit(ObjectFit::Cover).opacity(
+                    if tile.target.is_none() {
+                        1. - blend
+                    } else {
+                        1.
+                    },
+                ));
+            }
+            if let Some(image) = target {
+                cell = cell.child(
+                    img(image)
+                        .absolute()
+                        .inset_0()
+                        .size_full()
+                        .object_fit(ObjectFit::Cover)
+                        .opacity(if same || tile.source.is_none() {
+                            1.
+                        } else {
+                            blend
+                        }),
+                );
+            }
+            // These loads run in the paint lifecycle. Retained snapshots cover
+            // pending decodes, and the target grid stays alive behind this layer.
+            for photo in [&tile.source, &tile.target].into_iter().flatten() {
+                if let Some(path) = self.thumbnails.peek(&photo.fingerprint).cloned() {
+                    cell = cell.child(
+                        img(Arc::<std::path::Path>::from(path))
+                            .image_cache(&self.render_cache)
+                            .absolute()
+                            .inset_0()
+                            .size_full()
+                            .opacity(0.),
+                    );
                 }
-            });
-        })
-        .detach();
-        cx.notify();
+            }
+            grid = grid.child(cell);
+        }
+        let header_opacity = match (from.layout.full_bleed(), to.layout.full_bleed()) {
+            (false, false) => 1.,
+            (true, false) => progress,
+            (false, true) => 1. - progress,
+            _ => 0.,
+        };
+        surface = surface.child(grid);
+        surface
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w_full()
+                    .h(px(header))
+                    .overflow_hidden()
+                    .px_5()
+                    .pt_4()
+                    .opacity(header_opacity)
+                    .child(
+                        div()
+                            .text_size(px(28.))
+                            .font_weight(FontWeight::BOLD)
+                            .child(self.title()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(c.muted))
+                            .child(format!(
+                                "{} photos",
+                                self.total.unwrap_or(self.library.photos.len())
+                            )),
+                    ),
+            )
+            .into_any_element()
     }
     fn gallery_step(&mut self, larger: bool, w: &Window, cx: &mut Context<Self>) {
         let target = if larger {
@@ -2135,7 +2479,8 @@ impl PhotosApp {
         self.gallery_width = available;
         let photos = self.visible(cx);
         let photo_count = photos.len();
-        let layout = GalleryLayout::new(available, self.gallery_zoom);
+        let layout = GalleryLayout::new(available, self.gallery_zoom)
+            .with_count(photos.len(), self.preferences.bottom_to_top);
         let blocks = layout.blocks(photos.len());
         let mut content = div()
             .id("photo-grid")
@@ -2178,6 +2523,8 @@ impl PhotosApp {
                     )
                     .child(
                         div()
+                            .w(px((available - 40.).max(1.)))
+                            .truncate()
                             .text_size(px(12.))
                             .text_color(rgb(c.muted))
                             .child(subtitle),
@@ -2257,13 +2604,31 @@ impl PhotosApp {
                     .relative()
                     .flex_1()
                     .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .when(self.preferences.bottom_to_top, |d| d.justify_end())
                     .child(
                         canvas(
                             move |bounds, _, cx| {
                                 resize_entity.update(cx, |this, cx| {
+                                    this.thumbnail_budget(
+                                        layout,
+                                        f32::from(bounds.size.height),
+                                        cx,
+                                    );
+                                    let full_height = f32::from(bounds.size.height);
+                                    if (this.gallery_height - full_height).abs() > 0.5 {
+                                        this.gallery_height = full_height;
+                                        cx.notify();
+                                    }
+                                    let expected =
+                                        px((blocks as f32 * layout.block_height).min(full_height));
                                     let old =
                                         this.scroll.0.borrow().base_handle.bounds().size.height;
-                                    if old > px(0.) && (old - bounds.size.height).abs() > px(0.5) {
+                                    if this.gallery_motion.is_none()
+                                        && old > px(0.)
+                                        && (old - expected).abs() > px(0.5)
+                                    {
                                         this.preserve_gallery(cx);
                                         if this.gallery_restore.as_ref().is_some_and(|a| a.end) {
                                             this.scroll.scroll_to_item_strict(
@@ -2291,36 +2656,18 @@ impl PhotosApp {
                     .child(
                         uniform_list("photo-rows", blocks, move |range, _, cx| {
                             entity.update(cx, |this, cx| {
-                                let (offset, height) = {
+                                let offset = {
                                     let scroll = &this.scroll.0.borrow().base_handle;
-                                    (
-                                        f32::from(-scroll.offset().y),
-                                        f32::from(scroll.bounds().size.height),
-                                    )
+                                    f32::from(-scroll.offset().y)
                                 };
-                                let stale_offset = offset
-                                    < (range.start.saturating_sub(1)) as f32 * layout.block_height
-                                    || offset > (range.end + 1) as f32 * layout.block_height;
-                                if stale_offset {
-                                    cx.notify();
-                                }
                                 let mut period = None;
                                 let lines = range
                                     .map(|block| {
-                                        let from = block * layout.block_len;
-                                        let to = ((block + 1) * layout.block_len).min(photos.len());
+                                        let indices = layout.indices(block, photos.len());
                                         let mut line =
                                             div().relative().w_full().h(px(layout.block_height));
-                                        for index in from..to {
+                                        for index in indices {
                                             let cell = layout.cell(index);
-                                            if height > 0.
-                                                && !stale_offset
-                                                && (cell.y + layout.edge + layout.caption
-                                                    < offset - 100.
-                                                    || cell.y > offset + height + 100.)
-                                            {
-                                                continue;
-                                            }
                                             if let Some(photo) =
                                                 photos.get(&this.library, index).cloned()
                                             {
@@ -2334,9 +2681,7 @@ impl PhotosApp {
                                                     this.tile(&photo, index, layout, c, cx)
                                                         .absolute()
                                                         .left(px(cell.x))
-                                                        .top(px(layout
-                                                            .cell(index % layout.block_len)
-                                                            .y)),
+                                                        .top_0(),
                                                 );
                                             }
                                         }
@@ -2353,7 +2698,10 @@ impl PhotosApp {
                             })
                         })
                         .track_scroll(self.scroll.clone())
-                        .size_full(),
+                        .w_full()
+                        .h(px(blocks as f32 * layout.block_height))
+                        .max_h_full()
+                        .flex_shrink_0(),
                     )
                     .child(
                         div()
@@ -2369,29 +2717,32 @@ impl PhotosApp {
                     ),
             );
         }
-        if let Some(fade) = &self.gallery_fade {
-            content = content.child(
-                div()
-                    .id("gallery-crossfade")
-                    .absolute()
-                    .inset_0()
-                    .overflow_hidden()
-                    .children(fade.images.iter().map(|(image, x, y, edge)| {
-                        img(image.clone())
-                            .absolute()
-                            .left(px(*x))
-                            .top(px(*y))
-                            .size(px(*edge))
-                            .object_fit(ObjectFit::Cover)
-                    }))
-                    .with_animation(
-                        SharedString::from(format!("gallery-fade-{}", fade.epoch)),
-                        Animation::new(Duration::from_millis(160)),
-                        |d, t| d.opacity(1. - t),
-                    ),
-            );
+        if self.gallery_motion.is_some() {
+            content = content.child(self.motion_view(c, cx));
         }
-        if layout.full_bleed() && photo_count > 0 {
+        let date_opacity =
+            self.gallery_motion
+                .as_ref()
+                .map_or(if layout.full_bleed() { 1. } else { 0. }, |m| {
+                    match (m.from.layout.full_bleed(), m.to.layout.full_bleed()) {
+                        (true, true) => 1.,
+                        (true, false) => 1. - m.progress,
+                        (false, true) => m.progress,
+                        _ => 0.,
+                    }
+                });
+        if date_opacity > 0. && photo_count > 0 {
+            let photo_top = self.gallery_motion.as_ref().map_or_else(
+                || {
+                    if self.preferences.bottom_to_top {
+                        (self.gallery_height - blocks as f32 * layout.block_height).max(0.)
+                    } else {
+                        0.
+                    }
+                },
+                |m| m.from.header + (m.to.header - m.from.header) * m.progress,
+            );
+            let date_top = (photo_top + 12.).min((self.gallery_height - 76.).max(12.));
             let (year, month) = self
                 .gallery_period
                 .split_once('\n')
@@ -2399,9 +2750,10 @@ impl PhotosApp {
             content = content.child(
                 div()
                     .id("gallery-date-label")
+                    .opacity(date_opacity)
                     .debug_selector(|| "gallery-date-label".into())
                     .absolute()
-                    .top_3()
+                    .top(px(date_top))
                     .left_3()
                     .px_3()
                     .py_2()
@@ -2430,6 +2782,9 @@ impl PhotosApp {
                     );
                     let _ = w;
                     cx.stop_propagation();
+                } else if this.gallery_motion.is_some() {
+                    this.cancel_gallery_interaction();
+                    cx.notify();
                 }
             }))
             .on_mouse_down(
