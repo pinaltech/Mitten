@@ -142,6 +142,18 @@ pub fn connection_label(source: &Source) -> String {
 pub fn digest(s: &str) -> String {
     format!("{:x}", Sha256::digest(s.as_bytes()))
 }
+/// Disconnect credentials without deleting originals or library annotations.
+pub fn forget_credentials(source: &Source) -> Result<()> {
+    #[cfg(feature = "remote")]
+    if matches!(source.driver.as_str(), "immich" | "nextcloud") {
+        match remote::credential(source)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => (),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let _ = source;
+    Ok(())
+}
 
 pub fn open(source: &Source) -> Result<Box<dyn PhotosDriver>> {
     match source.driver.as_str() {

@@ -1,5 +1,113 @@
 # Verification
 
+## Gallery direction and viewer revision — October 31, 2026
+
+- **34 tests pass:** four geometry/cache tests, ten GPUI interaction tests,
+  one PhotoKit packaging regression, eight source tests and eleven storage tests.
+  Strict all-target Clippy, formatting, the native macOS build/bundle and both
+  usage-description checks pass. Core/remote compilation also passes for Linux
+  and Windows x86-64; Intel macOS core/remote/PhotoKit compilation passes.
+- Gallery levels now snap instead of interpolating photo positions. Existing
+  decoded thumbnails briefly crossfade over the new layout. The two smallest
+  levels are gapless squares with floating month/year; no level has filename
+  captions. Favorite hearts use proportional sizing, a contrasting outline,
+  matching selected fill and no background. Embedded image resources are
+  explicit, avoiding URI inference for single-component asset names.
+- Newest-at-bottom is the default and migrates automatically for old settings.
+  Behavior includes a persisted direction switch. GPUI tests cover initial
+  bottom placement, older metadata arriving above the view, staying at the
+  bottom, preserving a photo while browsing history, changing direction,
+  resizing, density changes, incomplete rows, new local arrivals, empty filters
+  and short libraries. Row heights match the virtual list's pixel rounding to
+  avoid accumulated scroll drift in long libraries.
+- Viewer tests exercise horizontal gesture movement, animated settle, momentum
+  suppression, cancellation and end boundaries. They verify pan eligibility,
+  centered header/footer metadata, and that the image canvas occupies all space
+  between the toolbars. Existing decode-ready thumbnail crossfades remain tested.
+- The million-record catalog test completes 5,000 synthetic metadata pages in
+  about **2.8 seconds**, fetching fewer than 100 thumbnails and zero viewer
+  previews/originals. Thumbnail requests now start during visible-tile prepaint,
+  so virtual-list measurement does not fetch off-screen rows. The million-record
+  scroll test still fills and evicts the 256-path/96-decoded-thumbnail caches;
+  cached test-frame checks were about **4–7 ms**, including test-executor work.
+- The optimized bookkeeping benchmark completed 100,000 visits in **71 ms**,
+  1,000,000 in **591 ms**, and 10,000,000 in **7.22 s**, retaining 256 paths and
+  requesting zero previews/originals. These are synthetic tests, not live-server
+  throughput or production FPS measurements.
+- Native review used the isolated generated-JPEG library/profile. Confirmed
+  margin direction, floating date labels, caption-free thumbnails, bottom startup,
+  the right-hand scrollbar, proportional outline/filled favorite hearts and direct
+  favorite toggling, viewer loading placement, centered precise timestamp,
+  filename/resolution divider, full-height image canvas and Behavior switch.
+  No personal library or provider account was opened. The review process was
+  stopped after verification.
+- Rebuilding an already launched macOS bundle exposed stale kernel signature
+  caching when overwriting its executable. The bundler now replaces the inode
+  atomically; rebuilding, both privacy checks and launching the review copy pass.
+
+Physical trackpad pinch/swipe feel remains unverified; synthetic GPUI gesture
+phases are covered. CUA's horizontal scroll action did not establish a physical
+trackpad gesture. Live providers, real TCC approval and native Linux/Windows GUI
+execution retain the limits recorded below. Earlier continuous-zoom descriptions
+are historical and superseded by this revision.
+
+## Appearance, catalog and gallery batch — October 31, 2026
+
+Before implementation, the production data directory at
+`~/Library/Application Support/com.pinal.DesertPhotos/` was reset. No saved remote
+credentials were present to remove. Original libraries were preserved. A Git
+repository was initialized in `GPUI Photos` and the baseline committed as
+`f993866` before the batch. The production profile was checked again after all
+verification and remains empty; all tests and desktop review used other profiles.
+
+- **32 tests pass:** four geometry/cache tests, eight GPUI interaction/layout
+  tests, one PhotoKit packaging regression, eight source/protocol tests, and
+  eleven storage tests. Formatting, strict all-target Clippy and native macOS
+  debug compilation/bundling pass. The bundle and executable still pass the
+  Foundation usage-description checks without requesting photo access.
+- Core/network-adapter compilation passes for Linux and Windows x86-64; core,
+  adapters and the PhotoKit bridge also compile for Intel macOS. Cross-checks
+  use the same temporary Zig compiler described in the earlier source batch.
+- Native review used 48 generated JPEG fixtures and an isolated bundle/profile.
+  Verified the saved count, compact grid, edge-to-edge square view with floating
+  year/month, left/right viewer controls, loading spinner during image upgrade,
+  ready image display, appearance swatches and immediate purple accent updates.
+  Removing the review library returned to onboarding and preserved all 48 JPEGs.
+  The isolated review process was stopped after review.
+
+Automatic cataloging fetches metadata pages continuously without a Load more
+control. Background batches combine at most 16 pages, yielding after 100 ms
+between requests. The synthetic **1,000,000-photo** GPUI catalog test completed
+all **5,000 metadata pages in 2.57 seconds** in a standalone instrumented run
+(2.67 seconds process elapsed), with **447,594,496 bytes (~427 MiB) maximum RSS**
+and zero swaps. It fetched fewer than 100 visible/prefetched thumbnails and
+**zero viewer previews or originals**. Counts are persisted, the loading state
+finishes, and unfiltered catalog growth does not allocate a full filtered index.
+This measures synthetic metadata/fixtures, not live-server throughput.
+
+The separate million-photo scroll test still fills and evicts the 256-path and
+96-decoded-thumbnail caches. Cached scroll checks were around 4.8–7.9 ms; new
+views took roughly 145–159 ms to drain the unoptimized test executor, including
+thumbnail encoding, synchronization and redraws. These are not production FPS
+measurements. Tests caught and fixed stale viewport culling on large scroll
+jumps; tile positions now use coordinates local to each virtual block.
+
+New coverage checks accent persistence and old-settings compatibility, removing
+active libraries without deleting originals, complete automatic cataloging,
+failure/retry without a request loop, modifier-wheel continuous zoom, gapless
+square geometry, month labels, and actual side-button navigation. Viewer tests
+force paint frames through cache eviction and re-decoding, checking that the
+thumbnail and loading state remain until the detailed image is decoded. The
+ready image fades over its thumbnail over 140 ms. Immich tests also cover a
+nullable `nextCursor` alongside a valid legacy `nextPage` token.
+
+Physical trackpad pinch, live provider accounts, real keyring credential removal,
+and native Linux/Windows GUI execution remain unverified. The native macOS pinch
+hook routes into the same tested continuous geometry as modifier-wheel zoom.
+Full metadata remains resident after cataloging; persistent disk thumbnails have
+no automatic quota. The earlier verification records below retain their original
+scope and timings.
+
 ## PhotoKit TCC crash fix — October 31, 2026
 
 The first source build used the incorrect `NSPhotosUsageDescription` key. Plist

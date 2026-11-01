@@ -21,6 +21,9 @@ impl<T> BoundedCache<T> {
             order: VecDeque::new(),
         }
     }
+    pub fn peek(&self, key: &str) -> Option<&T> {
+        self.values.get(key)
+    }
     pub fn get(&mut self, key: &str) -> Option<&T> {
         if self.values.contains_key(key) {
             self.order.retain(|k| k != key);

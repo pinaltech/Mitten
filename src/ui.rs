@@ -1,3 +1,4 @@
+use desert_photos::gallery::GalleryLayout;
 use desert_photos::loading::{BoundedCache, THUMBNAIL_CACHE, THUMBNAIL_JOBS, VIEWER_CACHE};
 use desert_photos::sources::{Connection, PhotoPage, ProviderKind};
 use desert_photos::storage::{self, Library, Photo, PhotosDriver, Preferences, Source};
@@ -6,7 +7,10 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     Root, Theme, ThemeMode,
     input::{Input, InputEvent, InputState},
+    scroll::{Scrollbar, ScrollbarShow},
+    switch::Switch,
 };
+use photo_view::PhotoView;
 use std::{cell::RefCell, collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 
 actions!(
@@ -59,10 +63,11 @@ struct DragPhotos {
     paths: Arc<RefCell<Vec<PathBuf>>>,
     offset: Point<Pixels>,
     preview: Option<PathBuf>,
+    colors: Colors,
 }
 impl Render for DragPhotos {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let c = Colors::new(false, Accent::Orange);
+        let c = self.colors;
         div().pl(self.offset.x).pt(self.offset.y).child(
             div()
                 .w(px(96.))
@@ -96,6 +101,8 @@ struct Marquee {
 }
 mod assets;
 mod image_cache;
+mod photo_view;
+mod progress;
 fn provider_logo(provider: ProviderKind, c: Colors) -> AnyElement {
     if provider == ProviderKind::Local {
         return div()
@@ -115,12 +122,24 @@ fn provider_logo(provider: ProviderKind, c: Colors) -> AnyElement {
     .flex_shrink_0()
     .into_any_element()
 }
+#[derive(Clone)]
+struct GalleryAnchor {
+    id: String,
+    fallback: usize,
+    within: f32,
+    screen: f32,
+    end: bool,
+}
+struct GalleryFade {
+    images: Vec<(Arc<RenderImage>, f32, f32, f32)>,
+    epoch: u64,
+}
 struct VisibleCache {
     revision: u64,
     count: usize,
     filter: Filter,
     query: String,
-    photos: Arc<Vec<Arc<Photo>>>,
+    photos: PhotoView,
 }
 pub struct PhotosApp {
     config_path: PathBuf,
@@ -160,13 +179,29 @@ pub struct PhotosApp {
     failed: BTreeSet<String>,
     sidebar: bool,
     inspector: bool,
-    tile_size: f32,
+    gallery_zoom: f32,
+    gallery_width: f32,
+    gallery_period: String,
+    gallery_reset: bool,
+    gallery_restore: Option<GalleryAnchor>,
+    gallery_pinch: Option<f32>,
+    gallery_pinch_epoch: u64,
+    gallery_fade: Option<GalleryFade>,
+    gallery_fade_epoch: u64,
+    swipe_offset: f32,
+    swipe_active: bool,
+    swipe_epoch: u64,
+    swipe_settling: bool,
+    swipe_blocked: bool,
+    swipe_last: Option<std::time::Instant>,
+    decoded_preview: Option<String>,
+    catalog_epoch: u64,
     viewport: ui::image_viewport::ImageViewport,
     viewer_bounds: Bounds<Pixels>,
     pan_start: Option<Point<Pixels>>,
     zoom_input: Entity<InputState>,
     menu: Option<Point<Pixels>>,
-    settings_appearance: bool,
+    settings_page: u8,
     marquee: Option<Marquee>,
     pending_delete: Vec<String>,
     modal: Option<Modal>,
@@ -222,7 +257,7 @@ impl PhotosApp {
                     this.selected.clear();
                     this.anchor = None;
                     this.viewer = None;
-                    this.scroll.scroll_to_item(0, ScrollStrategy::Top);
+                    this.reset_gallery();
                     cx.notify();
                 }
             }),
@@ -289,13 +324,29 @@ impl PhotosApp {
             failed: BTreeSet::new(),
             sidebar: true,
             inspector: false,
-            tile_size: 172.,
+            gallery_zoom: 2.,
+            gallery_width: 844.,
+            gallery_period: String::new(),
+            gallery_reset: true,
+            gallery_restore: None,
+            gallery_pinch: None,
+            gallery_pinch_epoch: 0,
+            gallery_fade: None,
+            gallery_fade_epoch: 0,
+            swipe_offset: 0.,
+            swipe_active: false,
+            swipe_epoch: 0,
+            swipe_settling: false,
+            swipe_blocked: false,
+            swipe_last: None,
+            decoded_preview: None,
+            catalog_epoch: 0,
             viewport: Default::default(),
             viewer_bounds: Bounds::default(),
             pan_start: None,
             zoom_input,
             menu: None,
-            settings_appearance: false,
+            settings_page: 0,
             marquee: None,
             pending_delete: vec![],
             modal: None,
@@ -354,17 +405,23 @@ impl PhotosApp {
         #[cfg(not(test))]
         cx.spawn_in(w, async move |this, cx| {
             loop {
-                Timer::after(Duration::from_millis(16)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
                 if this
                     .update_in(cx, |this, w, cx| {
                         let delta = ui::native_transfer::take_magnification(w);
-                        if delta != 0. && this.viewer.is_some() && this.modal.is_none() {
-                            let at = w.mouse_position() - this.viewer_bounds.center();
-                            this.viewport.set_zoom(
-                                this.viewport.zoom * (1. + delta).max(0.1),
-                                (at.x.into(), at.y.into()),
-                            );
-                            this.sync_zoom(w, cx);
+                        if delta != 0. && this.modal.is_none() {
+                            if this.viewer.is_some() {
+                                let at = w.mouse_position() - this.viewer_bounds.center();
+                                this.viewport.set_zoom(
+                                    this.viewport.zoom * (1. + delta).max(0.1),
+                                    (at.x.into(), at.y.into()),
+                                );
+                                this.sync_zoom(w, cx);
+                            } else {
+                                this.pinch_gallery(delta * 2.6, w.mouse_position(), false, cx);
+                            }
                             cx.notify();
                         }
                     })
@@ -384,8 +441,14 @@ impl PhotosApp {
                 "light" => false,
                 _ => ui::system_dark(w),
             },
-            Accent::Orange,
+            self.accent(),
         )
+    }
+    fn accent(&self) -> Accent {
+        Accent::ALL
+            .into_iter()
+            .find(|a| a.key() == self.preferences.accent)
+            .unwrap_or(Accent::Orange)
     }
     fn theme(&self, w: &mut Window, cx: &mut Context<Self>) {
         let dark = match self.preferences.appearance.as_str() {
@@ -402,6 +465,127 @@ impl PhotosApp {
             Some(w),
             cx,
         );
+        let c = self.colors(w);
+        let theme = Theme::global_mut(cx);
+        theme.colors.primary = rgb(c.accent).into();
+        theme.colors.ring = rgb(c.accent).into();
+        theme.colors.accent = rgb(c.soft).into();
+        theme.colors.background = rgb(c.bg).into();
+        theme.colors.foreground = rgb(c.text).into();
+        theme.colors.input = rgb(c.border).into();
+        theme.colors.muted_foreground = rgb(c.muted).into();
+        theme.colors.border = rgb(c.border).into();
+        cx.notify();
+    }
+    fn set_accent(&mut self, accent: Accent, w: &mut Window, cx: &mut Context<Self>) {
+        self.preferences.accent = accent.key().into();
+        if let Err(e) = self.preferences.save(&self.config_path) {
+            self.error = Some(e.to_string());
+        }
+        self.theme(w, cx);
+    }
+    fn loading_status(&self) -> Option<(String, Option<f32>)> {
+        if self.busy {
+            return Some((
+                if self.notice.is_empty() {
+                    "Working…".into()
+                } else {
+                    self.notice.clone()
+                },
+                None,
+            ));
+        }
+        if self.loading || self.has_more && !self.page_failed {
+            let count = self.library.photos.len();
+            return Some(match self.total {
+                Some(total) if total > 0 => (
+                    format!("Cataloging {count} / {total}"),
+                    Some(count as f32 / total as f32),
+                ),
+                _ => (format!("Cataloging · {count} photos"), None),
+            });
+        }
+        None
+    }
+    fn image_loading(&self) -> bool {
+        self.current()
+            .filter(|_| self.viewer.is_some())
+            .is_some_and(|p| {
+                self.decoded_preview.as_deref() != Some(&p.fingerprint)
+                    && !self.failed.contains(&format!("{}-preview", p.fingerprint))
+            })
+    }
+    fn remove_library(&mut self, source: Source, w: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        self.notice = "Removing library…".into();
+        cx.spawn_in(w, async move |this, cx| {
+            let credential_source = source.clone();
+            let result = cx
+                .background_executor()
+                .spawn(
+                    async move { desert_photos::sources::forget_credentials(&credential_source) },
+                )
+                .await;
+            let _ = this.update_in(cx, |this, w, cx| {
+                this.busy = false;
+                if let Err(error) = result {
+                    this.error = Some(format!("Cannot remove saved credentials: {error}"));
+                    this.load_more(cx);
+                    cx.notify();
+                    return;
+                }
+                let was_active = this.preferences.active.as_ref() == Some(&source.path);
+                let mut preferences = this.preferences.clone();
+                preferences.remove(&source);
+                if let Err(error) = preferences.save(&this.config_path) {
+                    this.error = Some(error.to_string());
+                    this.load_more(cx);
+                    cx.notify();
+                    return;
+                }
+                this.preferences = preferences;
+                this.notice = "Library removed".into();
+                if was_active {
+                    this.generation += 1;
+                    this.catalog_epoch += 1;
+                    this.scan_epoch += 1;
+                    this.driver = None;
+                    this.library = Library::default();
+                    this.library_changed();
+                    this.selected.clear();
+                    this.anchor = None;
+                    this.viewer = None;
+                    this.decoded_preview = None;
+                    this.has_more = false;
+                    this.next_page = None;
+                    this.loading = false;
+                    this.total = None;
+                    this.page_failed = false;
+                    this.pending.clear();
+                    this.failed.clear();
+                    this.failed_order.clear();
+                    this.previews.clear();
+                    this.thumbnails.clear();
+                    this.render_cache.update(cx, |cache, cx| cache.clear(w, cx));
+                    this.viewer_render_cache
+                        .update(cx, |cache, cx| cache.clear(w, cx));
+                    this.source_label = "Photos".into();
+                    this.modal = None;
+                    this.provider_step = None;
+                    this.search.update(cx, |e, cx| e.set_value("", w, cx));
+                    if let Some(next) = this.preferences.sources.first().cloned() {
+                        this.connect(next, w, cx);
+                    }
+                } else {
+                    this.load_more(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
     fn connect(&mut self, source: Source, w: &mut Window, cx: &mut Context<Self>) {
@@ -440,6 +624,7 @@ impl PhotosApp {
                 preferences.connect(driver.source());
                 if let Err(e) = preferences.save(&self.config_path) {
                     self.error = Some(e.to_string());
+                    self.load_more(cx);
                     cx.notify();
                     return;
                 }
@@ -448,7 +633,9 @@ impl PhotosApp {
                 self.library = page.library;
                 self.next_page = page.next;
                 self.has_more = self.next_page.is_some();
-                self.total = page.total;
+                self.total = page
+                    .total
+                    .or_else(|| (!self.has_more).then_some(self.library.photos.len()));
                 self.page_failed = false;
                 self.source_label = self.driver.as_ref().unwrap().source().label();
                 self.library_changed();
@@ -476,24 +663,19 @@ impl PhotosApp {
                 self.secret.update(cx, |e, cx| e.set_value("", w, cx));
                 self.search.update(cx, |e, cx| {
                     e.set_value("", w, cx);
-                    e.set_placeholder(
-                        if self.driver.as_ref().is_some_and(|d| d.paged()) {
-                            "Search loaded photos"
-                        } else {
-                            "Search photos"
-                        },
-                        w,
-                        cx,
-                    );
+                    e.set_placeholder("Search photos", w, cx);
                 });
-                self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+                self.reset_gallery();
                 self.focus.focus(w);
+                self.save_catalog_count();
+                self.load_more(cx);
             }
             Err(e) => {
                 self.error = Some(format!("Cannot connect: {e:#}"));
                 self.notice.clear();
             }
         }
+        self.load_more(cx);
         cx.notify();
     }
     fn library_changed(&mut self) {
@@ -635,14 +817,31 @@ impl PhotosApp {
         };
         let cursor = self.next_page.clone();
         let generation = self.generation;
+        let epoch = self.catalog_epoch;
         self.loading = true;
+        cx.notify();
         cx.spawn(async move |this, cx| {
-            let result = cx.background_executor().spawn(async move { driver.page(cursor.as_deref()) }).await;
+            let result = cx.background_executor().spawn(async move {
+                let started=std::time::Instant::now();
+                let mut combined=PhotoPage::default(); let mut cursor=cursor; let mut visited=BTreeSet::new();
+                for _ in 0..16 {
+                    if let Some(token)=&cursor { anyhow::ensure!(visited.insert(token.clone()),"Provider returned a repeated catalog cursor"); }
+                    let page=driver.page(cursor.as_deref())?;
+                    combined.library.photos.extend(page.library.photos);
+                    combined.library.albums.extend(page.library.albums);
+                    combined.total=page.total.or(combined.total);
+                    combined.next=page.next;
+                    if combined.next.is_none() || started.elapsed()>=Duration::from_millis(100) {break;}
+                    cursor=combined.next.clone();
+                }
+                Ok::<_,anyhow::Error>(combined)
+            }).await;
             let _ = this.update(cx, |this, cx| {
-                if generation != this.generation { return; }
+                if generation != this.generation || epoch != this.catalog_epoch { return; }
                 this.loading = false;
                 match result {
                     Ok(page) => {
+                        this.preserve_gallery(cx);
                         let before = this.library.photos.len();
                         for photo in page.library.photos {
                             if this.photo_index.contains_key(&photo.id) { continue; }
@@ -659,16 +858,30 @@ impl PhotosApp {
                             this.page_failed = true;
                             this.error = Some("The server returned no new photos. Retry or reconnect to refresh the library.".into());
                         }
-                        this.total = page.total.or(this.total);
+                        this.total = if this.has_more { page.total.or(this.total) } else { Some(this.library.photos.len()) };
+                        if !this.has_more { this.save_catalog_count(); }
                         this.revision += 1;
                         this.update_album_counts();
                         *this.visible_cache.borrow_mut() = None;
                     }
                     Err(e) => { this.page_failed = true; this.error = Some(format!("Could not load the next page: {e:#}")); }
                 }
+                this.load_more(cx);
                 cx.notify();
             });
         }).detach();
+    }
+    fn save_catalog_count(&mut self) {
+        if let Some(total) = self.total
+            && let Some(driver) = &self.driver
+        {
+            self.preferences
+                .catalog_counts
+                .insert(driver.source().path, total);
+            if let Err(e) = self.preferences.save(&self.config_path) {
+                self.error = Some(format!("Cannot save photo count: {e}"));
+            }
+        }
     }
     fn choose_folder(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let picker = cx.prompt_for_paths(PathPromptOptions {
@@ -713,11 +926,14 @@ impl PhotosApp {
                 this.loading = false;
                 match result {
                     Ok(library) => {
+                        this.preserve_gallery(cx);
+                        this.total = Some(library.photos.len());
                         this.library = library;
                         this.library_changed();
+                        this.save_catalog_count();
                         let visible = this
                             .visible(cx)
-                            .iter()
+                            .iter(&this.library)
                             .map(|p| p.id.clone())
                             .collect::<BTreeSet<_>>();
                         this.selected.retain(|id| visible.contains(id));
@@ -739,7 +955,7 @@ impl PhotosApp {
         work: impl FnOnce(Arc<dyn PhotosDriver>) -> anyhow::Result<T> + Send + 'static,
         done: impl FnOnce(&mut Self, T) + 'static,
     ) {
-        if self.busy || self.loading {
+        if self.busy {
             self.error = Some("Please wait for the current operation to finish.".into());
             cx.notify();
             return;
@@ -748,6 +964,7 @@ impl PhotosApp {
             return;
         };
         self.scan_epoch += 1;
+        self.catalog_epoch += 1;
         self.loading = false;
         self.busy = true;
         self.notice = "Working…".into();
@@ -774,61 +991,76 @@ impl PhotosApp {
                 // Refresh after failures too: a batch may have completed some files.
                 match refreshed {
                     Ok(library) => {
+                        this.preserve_gallery(cx);
                         this.library = library;
                         this.library_changed();
                     }
                     Err(e) => this.error = Some(format!("Cannot refresh library: {e}")),
                 }
                 let _ = w;
+                this.load_more(cx);
                 cx.notify();
             });
         })
         .detach();
     }
-    fn visible(&self, cx: &App) -> Arc<Vec<Arc<Photo>>> {
+    fn visible(&self, cx: &App) -> PhotoView {
         let query = self.search.read(cx).value().to_lowercase();
+        if self.filter == Filter::All && self.counts.1 == 0 && query.is_empty() {
+            return PhotoView {
+                indices: None,
+                count: self.library.photos.len(),
+                reversed: self.preferences.bottom_to_top,
+            };
+        }
         if let Some(cache) = self.visible_cache.borrow().as_ref()
             && cache.revision == self.revision
             && cache.count == self.library.photos.len()
             && cache.filter == self.filter
             && cache.query == query
+            && cache.photos.reversed == self.preferences.bottom_to_top
         {
             return cache.photos.clone();
         }
         let recent_cutoff = chrono::Utc::now() - chrono::Duration::days(30);
-        let photos = Arc::new(
-            self.library
-                .photos
-                .iter()
-                .filter(|p| match &self.filter {
-                    Filter::All => !p.deleted,
-                    Filter::Favorites => !p.deleted && p.favorite,
-                    Filter::Recent => !p.deleted && p.modified > recent_cutoff,
-                    Filter::Trash => p.deleted,
-                    Filter::Album(a) => {
-                        !p.deleted
-                            && self
-                                .library
-                                .albums
-                                .get(a)
-                                .is_some_and(|ids| ids.contains(&p.id))
-                    }
-                })
-                .filter(|p| {
-                    query.is_empty()
-                        || p.name.to_lowercase().contains(&query)
-                        || p.caption.to_lowercase().contains(&query)
-                        || p.id.to_lowercase().contains(&query)
-                })
-                .cloned()
-                .collect(),
-        );
+        let indices: Vec<usize> = self
+            .library
+            .photos
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| match &self.filter {
+                Filter::All => !p.deleted,
+                Filter::Favorites => !p.deleted && p.favorite,
+                Filter::Recent => !p.deleted && p.modified > recent_cutoff,
+                Filter::Trash => p.deleted,
+                Filter::Album(a) => {
+                    !p.deleted
+                        && self
+                            .library
+                            .albums
+                            .get(a)
+                            .is_some_and(|ids| ids.contains(&p.id))
+                }
+            })
+            .filter(|(_, p)| {
+                query.is_empty()
+                    || p.name.to_lowercase().contains(&query)
+                    || p.caption.to_lowercase().contains(&query)
+                    || p.id.to_lowercase().contains(&query)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let photos = PhotoView {
+            count: indices.len(),
+            reversed: self.preferences.bottom_to_top,
+            indices: Some(Arc::new(indices)),
+        };
         *self.visible_cache.borrow_mut() = Some(VisibleCache {
             revision: self.revision,
             count: self.library.photos.len(),
             filter: self.filter.clone(),
             query,
-            photos: Arc::clone(&photos),
+            photos: photos.clone(),
         });
         photos
     }
@@ -838,7 +1070,7 @@ impl PhotosApp {
         self.viewer = None;
         self.anchor = None;
         self.modal = None;
-        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.reset_gallery();
         self.focus.focus(w);
         cx.notify();
     }
@@ -872,7 +1104,7 @@ impl PhotosApp {
         cx: &mut Context<Self>,
     ) {
         let visible = self.visible(cx);
-        let Some(photo) = visible.get(index) else {
+        let Some(photo) = visible.get(&self.library, index).cloned() else {
             return;
         };
         if modifiers.shift
@@ -883,8 +1115,11 @@ impl PhotosApp {
             if !modifiers.platform {
                 self.selected.clear();
             }
-            self.selected
-                .extend(visible[from..=to].iter().map(|p| p.id.clone()));
+            self.selected.extend(
+                (from..=to)
+                    .filter_map(|i| visible.get(&self.library, i))
+                    .map(|p| p.id.clone()),
+            );
         } else if modifiers.platform || modifiers.control {
             if !self.selected.remove(&photo.id) {
                 self.selected.insert(photo.id.clone());
@@ -899,6 +1134,7 @@ impl PhotosApp {
         if double {
             self.selected = BTreeSet::from([photo.id.clone()]);
             self.viewer = Some(photo.id.clone());
+            self.decoded_preview = None;
             self.viewport.reset();
             self.pan_start = None;
             self.sync_zoom(w, cx);
@@ -914,6 +1150,7 @@ impl PhotosApp {
         if let Some(photo) = self.current() {
             self.selected = BTreeSet::from([photo.id.clone()]);
             self.viewer = Some(photo.id.clone());
+            self.decoded_preview = None;
             self.viewport.reset();
             self.pan_start = None;
             self.sync_zoom(w, cx);
@@ -933,13 +1170,153 @@ impl PhotosApp {
         }
         let current = self.current();
         let index = current
-            .and_then(|p| photos.iter().position(|f| f.id == p.id))
+            .and_then(|p| {
+                self.photo_index
+                    .get(&p.id)
+                    .and_then(|&i| photos.position(i))
+            })
             .unwrap_or(0);
         let next = (index as isize + amount).clamp(0, photos.len() as isize - 1) as usize;
         let viewer = self.viewer.is_some();
         self.select(next, viewer, Modifiers::none(), w, cx);
     }
+    fn can_pan(&self) -> bool {
+        let fit = self.viewport.fit_size();
+        self.viewport.zoom > 1.
+            && (fit.0 * self.viewport.zoom > self.viewport.viewport.0 + 0.5
+                || fit.1 * self.viewport.zoom > self.viewport.viewport.1 + 0.5)
+    }
+    fn viewer_swipe(
+        &mut self,
+        dx: f32,
+        dy: f32,
+        phase: TouchPhase,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let now = std::time::Instant::now();
+        let idle = self
+            .swipe_last
+            .is_none_or(|last| now.duration_since(last) > Duration::from_millis(220));
+        self.swipe_last = Some(now);
+        if self.swipe_settling {
+            return;
+        }
+        if matches!(phase, TouchPhase::Started)
+            || (idle && !self.swipe_active && !matches!(phase, TouchPhase::Ended))
+        {
+            self.swipe_blocked = false;
+            self.swipe_active = false;
+            self.swipe_offset = 0.;
+        }
+        if self.swipe_blocked {
+            return;
+        }
+        if !self.swipe_active && dx.abs() > dy.abs() && dx.abs() > 0. {
+            self.swipe_active = true;
+        }
+        if self.swipe_active {
+            let photos = self.visible(cx);
+            let index = self
+                .viewer
+                .as_ref()
+                .and_then(|id| self.photo_index.get(id))
+                .and_then(|&i| photos.position(i))
+                .unwrap_or(0);
+            let proposed = self.swipe_offset + dx;
+            let edge =
+                (proposed > 0. && index == 0) || (proposed < 0. && index + 1 >= photos.len());
+            self.swipe_offset = if edge {
+                proposed.clamp(-60., 60.)
+            } else {
+                proposed.clamp(-self.viewport.viewport.0, self.viewport.viewport.0)
+            };
+            cx.notify();
+        }
+        self.swipe_epoch += 1;
+        let epoch = self.swipe_epoch;
+        if matches!(phase, TouchPhase::Ended) {
+            self.finish_viewer_swipe(w, cx);
+        } else if self.swipe_active {
+            // Non-phased wheels and interrupted gestures also settle after idle.
+            cx.spawn_in(w, async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                let _ = this.update_in(cx, |this, w, cx| {
+                    if this.swipe_epoch == epoch {
+                        this.finish_viewer_swipe(w, cx);
+                    }
+                });
+            })
+            .detach();
+        }
+    }
+    fn finish_viewer_swipe(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if !self.swipe_active || self.swipe_settling {
+            return;
+        }
+        self.swipe_active = false;
+        self.swipe_blocked = true;
+        self.swipe_settling = true;
+        self.swipe_epoch += 1;
+        let epoch = self.swipe_epoch;
+        let start = self.swipe_offset;
+        let width = self.viewport.viewport.0.max(1.);
+        let photos = self.visible(cx);
+        let index = self
+            .viewer
+            .as_ref()
+            .and_then(|id| self.photo_index.get(id))
+            .and_then(|&i| photos.position(i))
+            .unwrap_or(0);
+        let amount = if start < -width.min(600.) * 0.14 && index + 1 < photos.len() {
+            1
+        } else if start > width.min(600.) * 0.14 && index > 0 {
+            -1
+        } else {
+            0
+        };
+        let end = -(amount as f32) * width;
+        let viewer = self.viewer.clone();
+        cx.spawn_in(w, async move |this, cx| {
+            for frame in 1..=12 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let keep = this
+                    .update_in(cx, |this, w, cx| {
+                        if this.swipe_epoch != epoch || this.viewer != viewer {
+                            this.swipe_settling = false;
+                            this.swipe_offset = 0.;
+                            return false;
+                        }
+                        let t = frame as f32 / 12.;
+                        this.swipe_offset = start + (end - start) * (1. - (1. - t).powi(3));
+                        if frame == 12 {
+                            this.swipe_offset = 0.;
+                            this.swipe_settling = false;
+                            if amount != 0 {
+                                this.step(amount, w, cx);
+                            }
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
     fn sync_zoom(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        self.swipe_epoch += 1;
+        self.swipe_offset = 0.;
+        self.swipe_active = false;
+        self.swipe_settling = false;
+        self.pan_start = None;
         self.zoom_input.update(cx, |e, cx| {
             e.set_value(format!("{:.0}%", self.viewport.zoom * 100.), w, cx)
         });
@@ -953,13 +1330,7 @@ impl PhotosApp {
         self.sync_zoom(w, cx);
         cx.notify();
     }
-    fn update_marquee(
-        &mut self,
-        position: Point<Pixels>,
-        columns: usize,
-        edge: f32,
-        cx: &mut Context<Self>,
-    ) {
+    fn update_marquee(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let handle = &self.scroll.0.borrow().base_handle;
         let bounds = handle.bounds();
         let offset = handle.offset();
@@ -979,10 +1350,16 @@ impl PhotosApp {
         let base = m.baseline.clone();
         let photos = self.visible(cx);
         self.selected = base;
-        for (i, photo) in photos.iter().enumerate() {
-            let x = px(20. + (i % columns) as f32 * (edge + 10.));
-            let y = px((i / columns) as f32 * (edge + 36.));
-            if x < right && x + px(edge) > left && y < bottom && y + px(edge + 26.) > top {
+        for (i, photo) in photos.iter(&self.library).enumerate() {
+            let layout = GalleryLayout::new(self.gallery_width, self.gallery_zoom);
+            let cell = layout.cell(i);
+            let x = px(cell.x);
+            let y = px(cell.y);
+            if x < right
+                && x + px(cell.edge) > left
+                && y < bottom
+                && y + px(cell.edge + layout.caption) > top
+            {
                 self.selected.insert(photo.id.clone());
             }
         }
@@ -1407,11 +1784,13 @@ impl PhotosApp {
         &mut self,
         photo: &Photo,
         index: usize,
-        edge: f32,
+        layout: GalleryLayout,
         c: Colors,
         cx: &mut Context<Self>,
     ) -> Div {
-        self.request_image(photo.clone(), false, cx);
+        let edge = layout.edge;
+        let request_photo = photo.clone();
+        let request_entity = cx.entity();
         let selected = self.selected.contains(&photo.id);
         let thumb = self.thumbnails.get(&photo.fingerprint).cloned();
         let failed = self
@@ -1424,12 +1803,13 @@ impl PhotosApp {
             source: self.driver.as_ref().unwrap().source().path,
             offset: point(px(0.), px(0.)),
             preview: thumb.clone(),
+            colors: c,
         };
         let heart_id = photo.id.clone();
         let entity = cx.weak_entity();
         div()
             .w(px(edge))
-            .h(px(edge + 26.))
+            .h(px(edge))
             .flex_shrink_0()
             .flex()
             .flex_col()
@@ -1442,10 +1822,10 @@ impl PhotosApp {
                     .group("photo-tile")
                     .w_full()
                     .h(px(edge))
-                    .rounded(px(9.))
+                    .rounded(px(layout.radius))
                     .overflow_hidden()
                     .cursor_pointer()
-                    .border_2()
+                    .when(!layout.full_bleed() || selected, |d| d.border_2())
                     .border_color(if selected {
                         rgb(c.accent).into()
                     } else {
@@ -1453,6 +1833,18 @@ impl PhotosApp {
                     })
                     .bg(rgb(c.bg))
                     .hover(|s| s.opacity(0.87))
+                    .child(
+                        canvas(
+                            move |_, _, cx| {
+                                request_entity.update(cx, |this, cx| {
+                                    this.request_image(request_photo, false, cx)
+                                });
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
                     .child(if let Some(path) = thumb {
                         img(Arc::<std::path::Path>::from(path))
                             .image_cache(&self.render_cache)
@@ -1480,16 +1872,27 @@ impl PhotosApp {
                     })
                     .when(!photo.deleted, |d| {
                         d.child(
-                            kit::tool("hover-favorite", "heart", "Favorite photo", c)
+                            div()
+                                .id("hover-favorite")
+                                .debug_selector(move || format!("photo-heart-{index}"))
                                 .absolute()
-                                .bottom_2()
-                                .left_2()
-                                .rounded(px(7.))
-                                .bg(rgb(c.surface))
+                                .bottom(relative(0.055))
+                                .left(relative(0.055))
+                                .size(relative(0.08))
+                                .cursor_pointer()
+                                .child(
+                                    img(ImageSource::Resource(Resource::Embedded(
+                                        SharedString::from(if photo.favorite {
+                                            "photo-heart-filled.svg"
+                                        } else {
+                                            "photo-heart.svg"
+                                        }),
+                                    )))
+                                    .size_full(),
+                                )
                                 .when(!photo.favorite, |d| {
                                     d.invisible().group_hover("photo-tile", |s| s.visible())
                                 })
-                                .when(photo.favorite, |d| d.bg(rgb(c.soft)))
                                 .on_click(cx.listener(move |this, _, w, cx| {
                                     cx.stop_propagation();
                                     this.favorite_one(heart_id.clone(), w, cx);
@@ -1502,7 +1905,7 @@ impl PhotosApp {
                         cx.listener(move |this, e: &MouseDownEvent, w, cx| {
                             cx.stop_propagation();
                             let visible = this.visible(cx);
-                            if let Some(photo) = visible.get(index)
+                            if let Some(photo) = visible.get(&this.library, index)
                                 && !this.selected.contains(&photo.id)
                             {
                                 this.select(index, false, Modifiers::none(), w, cx);
@@ -1552,74 +1955,240 @@ impl PhotosApp {
                         cx.new(|_| preview)
                     }),
             )
-            .child(
-                div()
-                    .px_1()
-                    .text_size(px(10.))
-                    .text_color(rgb(c.muted))
-                    .truncate()
-                    .child(photo.name.clone()),
-            )
+    }
+    fn reset_gallery(&mut self) {
+        self.gallery_reset = true;
+        self.gallery_restore = None;
+        self.gallery_fade = None;
+        self.gallery_pinch = None;
+    }
+    fn capture_gallery_anchor(&self, cx: &App) -> Option<GalleryAnchor> {
+        let photos = self.visible(cx);
+        if photos.is_empty() {
+            return None;
+        }
+        let layout = GalleryLayout::new(self.gallery_width, self.gallery_zoom);
+        let scroll = &self.scroll.0.borrow().base_handle;
+        let height = f32::from(scroll.bounds().size.height);
+        let offset = f32::from(-scroll.offset().y).max(0.);
+        let max = (layout.blocks(photos.len()) as f32 * layout.block_height - height).max(0.);
+        let screen = height / 2.;
+        let index = layout.nearest(self.gallery_width / 2., offset + screen, photos.len());
+        let cell = layout.cell(index);
+        Some(GalleryAnchor {
+            id: photos.get(&self.library, index)?.id.clone(),
+            fallback: index,
+            within: ((offset + screen - cell.y) / cell.edge).clamp(0., 1.),
+            screen,
+            end: if self.preferences.bottom_to_top {
+                max - offset < 2.
+            } else {
+                offset < 2.
+            },
+        })
+    }
+    fn preserve_gallery(&mut self, cx: &App) {
+        if !self.gallery_reset
+            && self.gallery_restore.is_none()
+            && self.scroll.0.borrow().deferred_scroll_to_item.is_none()
+        {
+            self.gallery_restore = self.capture_gallery_anchor(cx);
+        }
+    }
+    fn set_scroll_direction(&mut self, bottom_to_top: bool, cx: &mut Context<Self>) {
+        if self.preferences.bottom_to_top == bottom_to_top {
+            return;
+        }
+        self.preserve_gallery(cx);
+        // A direction change keeps the same photo visible, even at either end.
+        if let Some(anchor) = &mut self.gallery_restore {
+            anchor.end = false;
+        }
+        self.preferences.bottom_to_top = bottom_to_top;
+        if let Err(e) = self.preferences.save(&self.config_path) {
+            self.error = Some(e.to_string());
+        }
+        *self.visible_cache.borrow_mut() = None;
+        cx.notify();
+    }
+    fn pinch_gallery(
+        &mut self,
+        delta: f32,
+        pointer: Point<Pixels>,
+        ended: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !delta.is_finite() || self.viewer.is_some() || self.modal.is_some() {
+            return;
+        }
+        let value = (self.gallery_pinch.unwrap_or(self.gallery_zoom) + delta)
+            .clamp(0., GalleryLayout::MAX_ZOOM);
+        self.gallery_pinch = Some(value);
+        self.gallery_pinch_epoch += 1;
+        if ended {
+            self.finish_gallery_pinch(pointer, cx);
+            return;
+        }
+        let epoch = self.gallery_pinch_epoch;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(140))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.gallery_pinch_epoch == epoch {
+                    this.finish_gallery_pinch(pointer, cx);
+                }
+            });
+        })
+        .detach();
+    }
+    fn finish_gallery_pinch(&mut self, pointer: Point<Pixels>, cx: &mut Context<Self>) {
+        if let Some(target) = self.gallery_pinch.take() {
+            self.zoom_gallery(target.round() - self.gallery_zoom, pointer, cx);
+        }
+    }
+    fn zoom_gallery(&mut self, delta: f32, pointer: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.driver.is_none()
+            || self.viewer.is_some()
+            || self.modal.is_some()
+            || !delta.is_finite()
+        {
+            return;
+        }
+        let target = (self.gallery_zoom + delta)
+            .round()
+            .clamp(0., GalleryLayout::MAX_ZOOM);
+        if target == self.gallery_zoom {
+            return;
+        }
+        let old = GalleryLayout::new(self.gallery_width, self.gallery_zoom);
+        let photos = self.visible(cx);
+        let (bounds, offset) = {
+            let h = &self.scroll.0.borrow().base_handle;
+            (h.bounds(), f32::from(-h.offset().y))
+        };
+        let height = f32::from(bounds.size.height);
+        let mut anchor = self.capture_gallery_anchor(cx);
+        if bounds.contains(&pointer)
+            && let Some(a) = &mut anchor
+        {
+            let local = pointer - bounds.origin;
+            let i = old.nearest(local.x.into(), offset + f32::from(local.y), photos.len());
+            if let Some(photo) = photos.get(&self.library, i) {
+                a.id = photo.id.clone();
+                a.fallback = i;
+                a.screen = local.y.into();
+                a.within = ((offset + a.screen - old.cell(i).y) / old.edge).clamp(0., 1.);
+            }
+        }
+        // Retain only already decoded, on-screen thumbnails during the crossfade.
+        let first = (offset.max(0.) / old.block_height) as usize * old.block_len;
+        let last = (((offset + height) / old.block_height).ceil() as usize * old.block_len)
+            .min(photos.len());
+        let cache = self.render_cache.read(cx);
+        let images = (first..last)
+            .filter_map(|i| {
+                let photo = photos.get(&self.library, i)?;
+                let path = self.thumbnails.peek(&photo.fingerprint)?;
+                let image = cache.ready(path)?;
+                let cell = old.cell(i);
+                Some((
+                    image,
+                    cell.x,
+                    cell.y - offset + if old.full_bleed() { 0. } else { 84. },
+                    cell.edge,
+                ))
+            })
+            .collect();
+        self.gallery_fade_epoch += 1;
+        let epoch = self.gallery_fade_epoch;
+        self.gallery_fade = Some(GalleryFade { images, epoch });
+        self.gallery_zoom = target;
+        self.gallery_restore = anchor;
+        self.marquee = None;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(180))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.gallery_fade_epoch == epoch {
+                    this.gallery_fade = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+    fn gallery_step(&mut self, larger: bool, w: &Window, cx: &mut Context<Self>) {
+        let target = if larger {
+            self.gallery_zoom.floor() + 1.
+        } else {
+            self.gallery_zoom.ceil() - 1.
+        };
+        self.zoom_gallery(target - self.gallery_zoom, w.mouse_position(), cx);
     }
     fn grid_view(&mut self, available: f32, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
+        if (self.gallery_width - available).abs() > 0.5 {
+            self.preserve_gallery(cx);
+        }
+        self.gallery_width = available;
         let photos = self.visible(cx);
-        let columns = ((available - 40.) / (self.tile_size + 10.)).floor().max(1.) as usize;
-        let edge = ((available - 40. - (columns.saturating_sub(1)) as f32 * 10.) / columns as f32)
-            .max(40.);
-        let rows = photos.len().div_ceil(columns);
+        let photo_count = photos.len();
+        let layout = GalleryLayout::new(available, self.gallery_zoom);
+        let blocks = layout.blocks(photos.len());
         let mut content = div()
             .id("photo-grid")
             .debug_selector(|| "photo-grid".into())
             .flex_1()
             .min_w_0()
             .min_h_0()
+            .relative()
             .flex()
             .flex_col()
-            .child(
+            .overflow_hidden();
+        if !layout.full_bleed() {
+            let count = if self.filter == Filter::All && self.search.read(cx).value().is_empty() {
+                self.total.unwrap_or(photos.len())
+            } else {
+                photos.len()
+            };
+            let subtitle = if self.has_more {
+                format!("{count} photos · cataloging {}", self.library.photos.len())
+            } else {
+                format!("{count} photos")
+            };
+            content = content.child(
                 div()
-                    .px_5()
-                    .pt_5()
-                    .pb_4()
-                    .flex_shrink_0()
+                    .h(px(84.))
+                    .w_full()
                     .flex()
-                    .items_end()
-                    .gap_2()
+                    .flex_col()
+                    .flex_shrink_0()
+                    .px_5()
+                    .pt_4()
+                    .pb_3()
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .text_size(px(28.))
-                                    .font_weight(FontWeight::BOLD)
-                                    .truncate()
-                                    .child(self.title()),
-                            )
-                            .when(!photos.is_empty(), |d| {
-                                d.child(
-                                    div()
-                                        .mt_1()
-                                        .text_size(px(12.))
-                                        .text_color(rgb(c.muted))
-                                        .child(format!(
-                                            "{} {} · {}",
-                                            photos.len(),
-                                            if self.has_more {
-                                                "photos loaded"
-                                            } else {
-                                                "photos"
-                                            },
-                                            photos[0].modified.format("%B %Y")
-                                        )),
-                                )
-                            }),
+                            .w(px((available - 40.).max(1.)))
+                            .text_size(px(28.))
+                            .font_weight(FontWeight::BOLD)
+                            .truncate()
+                            .child(self.title()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(c.muted))
+                            .child(subtitle),
                     ),
             );
+        }
         if photos.is_empty() {
             content = content.child(kit::empty(
                 "photos",
-                if self.loading {
-                    "Loading photos…"
+                if self.loading || self.has_more && !self.page_failed {
+                    "Cataloging photos…"
                 } else if !self.search.read(cx).value().is_empty() {
                     "No Results"
                 } else {
@@ -1634,62 +2203,238 @@ impl PhotosApp {
                 c,
             ));
         } else {
+            if self.gallery_reset {
+                self.scroll.scroll_to_item_strict(
+                    if self.preferences.bottom_to_top {
+                        blocks.saturating_sub(1)
+                    } else {
+                        0
+                    },
+                    if self.preferences.bottom_to_top {
+                        ScrollStrategy::Bottom
+                    } else {
+                        ScrollStrategy::Top
+                    },
+                );
+                self.gallery_reset = false;
+                self.gallery_restore = None;
+            } else if let Some(anchor) = self.gallery_restore.take() {
+                if anchor.end {
+                    self.scroll.scroll_to_item_strict(
+                        if self.preferences.bottom_to_top {
+                            blocks.saturating_sub(1)
+                        } else {
+                            0
+                        },
+                        if self.preferences.bottom_to_top {
+                            ScrollStrategy::Bottom
+                        } else {
+                            ScrollStrategy::Top
+                        },
+                    );
+                } else {
+                    let index = self
+                        .photo_index
+                        .get(&anchor.id)
+                        .and_then(|&i| photos.position(i))
+                        .unwrap_or(anchor.fallback.min(photos.len() - 1));
+                    let height = f32::from(self.scroll.0.borrow().base_handle.bounds().size.height);
+                    let max = (blocks as f32 * layout.block_height - height).max(0.);
+                    let offset = (layout.cell(index).y + anchor.within * layout.edge
+                        - anchor.screen)
+                        .clamp(0., max);
+                    self.scroll
+                        .0
+                        .borrow()
+                        .base_handle
+                        .set_offset(point(px(0.), px(-offset)));
+                }
+            }
             let entity = cx.entity();
+            let resize_entity = entity.clone();
             content = content.child(
-                uniform_list("photo-rows", rows, move |range, _, cx| {
-                    entity.update(cx, |this, cx| {
-                        if range.end.saturating_add(3) >= rows {
-                            this.load_more(cx);
-                        }
-                        range
-                            .map(|row| {
-                                let visible = desert_photos::loading::visible_range(
-                                    row..row + 1,
-                                    columns,
-                                    photos.len(),
-                                );
-                                let from = visible.start;
-                                let to = visible.end;
-                                let mut line = div()
-                                    .px_5()
-                                    .pb(px(10.))
-                                    .h(px(edge + 36.))
-                                    .flex()
-                                    .gap(px(10.));
-                                for (offset, photo) in photos[from..to].iter().enumerate() {
-                                    line = line.child(this.tile(photo, from + offset, edge, c, cx));
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        canvas(
+                            move |bounds, _, cx| {
+                                resize_entity.update(cx, |this, cx| {
+                                    let old =
+                                        this.scroll.0.borrow().base_handle.bounds().size.height;
+                                    if old > px(0.) && (old - bounds.size.height).abs() > px(0.5) {
+                                        this.preserve_gallery(cx);
+                                        if this.gallery_restore.as_ref().is_some_and(|a| a.end) {
+                                            this.scroll.scroll_to_item_strict(
+                                                if this.preferences.bottom_to_top {
+                                                    blocks.saturating_sub(1)
+                                                } else {
+                                                    0
+                                                },
+                                                if this.preferences.bottom_to_top {
+                                                    ScrollStrategy::Bottom
+                                                } else {
+                                                    ScrollStrategy::Top
+                                                },
+                                            );
+                                        }
+                                        cx.notify();
+                                    }
+                                });
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+                    .child(
+                        uniform_list("photo-rows", blocks, move |range, _, cx| {
+                            entity.update(cx, |this, cx| {
+                                let (offset, height) = {
+                                    let scroll = &this.scroll.0.borrow().base_handle;
+                                    (
+                                        f32::from(-scroll.offset().y),
+                                        f32::from(scroll.bounds().size.height),
+                                    )
+                                };
+                                let stale_offset = offset
+                                    < (range.start.saturating_sub(1)) as f32 * layout.block_height
+                                    || offset > (range.end + 1) as f32 * layout.block_height;
+                                if stale_offset {
+                                    cx.notify();
                                 }
-                                line
+                                let mut period = None;
+                                let lines = range
+                                    .map(|block| {
+                                        let from = block * layout.block_len;
+                                        let to = ((block + 1) * layout.block_len).min(photos.len());
+                                        let mut line =
+                                            div().relative().w_full().h(px(layout.block_height));
+                                        for index in from..to {
+                                            let cell = layout.cell(index);
+                                            if height > 0.
+                                                && !stale_offset
+                                                && (cell.y + layout.edge + layout.caption
+                                                    < offset - 100.
+                                                    || cell.y > offset + height + 100.)
+                                            {
+                                                continue;
+                                            }
+                                            if let Some(photo) =
+                                                photos.get(&this.library, index).cloned()
+                                            {
+                                                if period.is_none() && cell.y + cell.edge >= offset
+                                                {
+                                                    period = Some(
+                                                        photo.modified.format("%Y\n%B").to_string(),
+                                                    );
+                                                }
+                                                line = line.child(
+                                                    this.tile(&photo, index, layout, c, cx)
+                                                        .absolute()
+                                                        .left(px(cell.x))
+                                                        .top(px(layout
+                                                            .cell(index % layout.block_len)
+                                                            .y)),
+                                                );
+                                            }
+                                        }
+                                        line
+                                    })
+                                    .collect::<Vec<_>>();
+                                if let Some(period) = period
+                                    && this.gallery_period != period
+                                {
+                                    this.gallery_period = period;
+                                    cx.notify();
+                                }
+                                lines
                             })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .track_scroll(self.scroll.clone())
-                .flex_1()
-                .min_h_0(),
+                        })
+                        .track_scroll(self.scroll.clone())
+                        .size_full(),
+                    )
+                    .child(
+                        div()
+                            .id("gallery-scrollbar-layer")
+                            .debug_selector(|| "gallery-scrollbar-layer".into())
+                            .absolute()
+                            .inset_0()
+                            .child(
+                                Scrollbar::vertical(&self.scroll)
+                                    .id("gallery-scrollbar")
+                                    .scrollbar_show(ScrollbarShow::Always),
+                            ),
+                    ),
             );
         }
-        content = content.when(self.has_more, |d| {
-            d.child(
-                ui::button("load-more-photos", c, false, false)
-                    .debug_selector(|| "load-more-photos".into())
-                    .child(if self.loading {
-                        "Loading photos…"
-                    } else if self.page_failed {
-                        "Retry loading photos"
-                    } else {
-                        "Load more photos"
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.page_failed = false;
-                        this.load_more(cx);
-                    })),
-            )
-        });
+        if let Some(fade) = &self.gallery_fade {
+            content = content.child(
+                div()
+                    .id("gallery-crossfade")
+                    .absolute()
+                    .inset_0()
+                    .overflow_hidden()
+                    .children(fade.images.iter().map(|(image, x, y, edge)| {
+                        img(image.clone())
+                            .absolute()
+                            .left(px(*x))
+                            .top(px(*y))
+                            .size(px(*edge))
+                            .object_fit(ObjectFit::Cover)
+                    }))
+                    .with_animation(
+                        SharedString::from(format!("gallery-fade-{}", fade.epoch)),
+                        Animation::new(Duration::from_millis(160)),
+                        |d, t| d.opacity(1. - t),
+                    ),
+            );
+        }
+        if layout.full_bleed() && photo_count > 0 {
+            let (year, month) = self
+                .gallery_period
+                .split_once('\n')
+                .unwrap_or(("", "Library"));
+            content = content.child(
+                div()
+                    .id("gallery-date-label")
+                    .debug_selector(|| "gallery-date-label".into())
+                    .absolute()
+                    .top_3()
+                    .left_3()
+                    .px_3()
+                    .py_2()
+                    .rounded(px(12.))
+                    .bg(rgba(0x15181dcc))
+                    .text_color(rgb(0xffffff))
+                    .child(div().text_size(px(11.)).child(year.to_owned()))
+                    .child(
+                        div()
+                            .text_size(px(20.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(month.to_owned()),
+                    )
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+            );
+        }
         content
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, w, cx| {
+                if event.modifiers.platform || event.modifiers.control {
+                    let delta = event.delta.pixel_delta(px(28.));
+                    this.pinch_gallery(
+                        f32::from(delta.y) * 0.006,
+                        event.position,
+                        matches!(event.touch_phase, TouchPhase::Ended),
+                        cx,
+                    );
+                    let _ = w;
+                    cx.stop_propagation();
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, e: &MouseDownEvent, w, cx| {
+                cx.listener(|this, e: &MouseDownEvent, w, cx| {
                     if this.modal.is_some() {
                         return;
                     }
@@ -1714,9 +2459,9 @@ impl PhotosApp {
                     cx.notify();
                 }),
             )
-            .on_mouse_move(cx.listener(move |this, e: &MouseMoveEvent, _, cx| {
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
                 if e.dragging() && this.marquee.is_some() {
-                    this.update_marquee(e.position, columns, edge, cx);
+                    this.update_marquee(e.position, cx);
                 }
             }))
             .on_mouse_up(
@@ -1752,14 +2497,54 @@ impl PhotosApp {
             .bg(rgb(c.bg));
         if let Some(photo) = photo {
             self.request_image(photo.clone(), true, cx);
-            let path = self
-                .previews
-                .get(&photo.fingerprint)
-                .or_else(|| self.thumbnails.get(&photo.fingerprint))
-                .cloned();
+            let thumbnail_path = self.thumbnails.get(&photo.fingerprint).cloned();
+            let preview_path = self.previews.get(&photo.fingerprint).cloned();
+            let thumbnail = thumbnail_path
+                .and_then(|path| {
+                    self.render_cache
+                        .update(cx, |cache, cx| cache.load(&Resource::from(path), w, cx))
+                })
+                .and_then(|result| result.ok());
+            let preview = preview_path.and_then(|path| {
+                self.viewer_render_cache
+                    .update(cx, |cache, cx| cache.load(&Resource::from(path), w, cx))
+            });
+            let preview = match preview {
+                Some(Ok(image)) => {
+                    if self.decoded_preview.as_deref() != Some(&photo.fingerprint) {
+                        self.decoded_preview = Some(photo.fingerprint.clone());
+                        cx.notify();
+                    }
+                    Some(image)
+                }
+                Some(Err(_)) => {
+                    self.failed.insert(format!("{}-preview", photo.fingerprint));
+                    None
+                }
+                None => None,
+            };
+            let base = thumbnail.clone().or_else(|| preview.clone());
+            let viewer_index = self
+                .photo_index
+                .get(&photo.id)
+                .and_then(|&i| self.visible(cx).position(i))
+                .unwrap_or(0);
+            self.anchor = Some(viewer_index);
+            let can_previous = viewer_index > 0;
+            let can_next = self.anchor.is_some_and(|i| i + 1 < self.visible(cx).len());
             view = view.child(
                 div()
-                    .h(px(48.))
+                    .id("viewer-toolbar")
+                    .debug_selector(|| "viewer-toolbar".into())
+                    .relative()
+                    .h(px(if f32::from(self.viewer_bounds.size.width) < 600. {
+                        78.
+                    } else {
+                        48.
+                    }))
+                    .when(f32::from(self.viewer_bounds.size.width) < 600., |d| {
+                        d.pt(px(30.))
+                    })
                     .px_3()
                     .flex_shrink_0()
                     .flex()
@@ -1774,22 +2559,50 @@ impl PhotosApp {
                             }),
                         ),
                     )
+                    .child(div().flex_1().min_w_0().when(self.image_loading(), |d| {
+                        d.child(progress::indicator(
+                            "Loading full image…".into(),
+                            None,
+                            f32::from(self.viewer_bounds.size.width) > 900.,
+                            c,
+                        ))
+                    }))
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
+                            .id("viewer-date")
+                            .debug_selector(|| "viewer-date".into())
+                            .absolute()
+                            .top(px(if f32::from(self.viewer_bounds.size.width) < 600. {
+                                8.
+                            } else {
+                                16.
+                            }))
+                            .left(relative(
+                                if f32::from(self.viewer_bounds.size.width) < 600. {
+                                    0.05
+                                } else {
+                                    0.25
+                                },
+                            ))
+                            .w(relative(
+                                if f32::from(self.viewer_bounds.size.width) < 600. {
+                                    0.9
+                                } else {
+                                    0.5
+                                },
+                            ))
+                            .text_center()
                             .text_size(px(12.))
-                            .child(photo.name.clone()),
+                            .truncate()
+                            .child(
+                                photo
+                                    .modified
+                                    .with_timezone(&chrono::Local)
+                                    .format("%b %-d, %Y · %-I:%M:%S %p")
+                                    .to_string(),
+                            ),
                     )
-                    .child(
-                        kit::tool("previous-photo", "back", "Previous photo · ←", c)
-                            .on_click(cx.listener(|this, _, w, cx| this.step(-1, w, cx))),
-                    )
-                    .child(
-                        kit::tool("next-photo", "next", "Next photo · →", c)
-                            .on_click(cx.listener(|this, _, w, cx| this.step(1, w, cx))),
-                    )
+                    .child(div().flex_1().min_w_0())
                     .child(
                         kit::tool("zoom-out", "minus", "Zoom out · ⌘−", c)
                             .on_click(cx.listener(|this, _, w, cx| this.zoom_by(1. / 1.2, w, cx))),
@@ -1816,7 +2629,14 @@ impl PhotosApp {
                     ),
             );
             let viewport = &mut self.viewport;
-            viewport.image = (photo.width as f32, photo.height as f32);
+            viewport.image = if photo.width > 0 && photo.height > 0 {
+                (photo.width as f32, photo.height as f32)
+            } else if let Some(image) = &base {
+                let size = image.size(0);
+                (size.width.0 as f32, size.height.0 as f32)
+            } else {
+                (1., 1.)
+            };
             let fit = viewport.fit_size();
             let size = (fit.0 * viewport.zoom, fit.1 * viewport.zoom);
             let position = (
@@ -1824,145 +2644,235 @@ impl PhotosApp {
                 (viewport.viewport.1 - size.1) / 2. + viewport.pan.1,
             );
             let entity = cx.entity();
-            view = view
-                .child(
-                    div()
-                        .id("viewer-canvas")
-                        .debug_selector(|| "viewer-canvas".into())
-                        .flex_1()
-                        .min_h_0()
-                        .min_w_0()
-                        .relative()
-                        .overflow_hidden()
-                        .cursor(if self.pan_start.is_some() {
-                            CursorStyle::ClosedHand
-                        } else {
-                            CursorStyle::OpenHand
-                        })
-                        .child(
-                            canvas(
-                                move |bounds, _, cx| {
-                                    entity.update(cx, |this, cx| {
-                                        let old = this.viewport.viewport;
-                                        this.viewer_bounds = bounds;
-                                        this.viewport.layout(
-                                            (bounds.size.width.into(), bounds.size.height.into()),
-                                            this.viewport.image,
-                                        );
-                                        if old != this.viewport.viewport {
-                                            cx.notify();
-                                        }
-                                    });
-                                },
-                                |_, _, _, _| {},
-                            )
-                            .absolute()
-                            .inset_0(),
+            view = view.child(
+                div()
+                    .id("viewer-canvas")
+                    .debug_selector(|| "viewer-canvas".into())
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .relative()
+                    .overflow_hidden()
+                    .cursor(if !self.can_pan() {
+                        CursorStyle::Arrow
+                    } else if self.pan_start.is_some() {
+                        CursorStyle::ClosedHand
+                    } else {
+                        CursorStyle::OpenHand
+                    })
+                    .child(
+                        canvas(
+                            move |bounds, _, cx| {
+                                entity.update(cx, |this, cx| {
+                                    let old = this.viewport.viewport;
+                                    this.viewer_bounds = bounds;
+                                    this.viewport.layout(
+                                        (bounds.size.width.into(), bounds.size.height.into()),
+                                        this.viewport.image,
+                                    );
+                                    if old != this.viewport.viewport {
+                                        cx.notify();
+                                    }
+                                });
+                            },
+                            |_, _, _, _| {},
                         )
-                        .child(if let Some(path) = path {
-                            img(Arc::<std::path::Path>::from(path))
-                                .image_cache(&self.viewer_render_cache)
-                                .absolute()
-                                .left(px(position.0))
-                                .top(px(position.1))
-                                .w(px(size.0))
-                                .h(px(size.1))
-                                .object_fit(ObjectFit::Contain)
-                                .into_any_element()
-                        } else {
-                            kit::empty(
-                                "photos",
-                                if self
-                                    .failed
-                                    .contains(&format!("{}-preview", photo.fingerprint))
-                                {
-                                    "Preview unavailable"
-                                } else {
-                                    "Loading preview…"
-                                },
-                                "",
-                                c,
-                            )
+                        .absolute()
+                        .inset_0(),
+                    )
+                    .child(if let Some(base) = base {
+                        div()
+                            .id("viewer-image-layers")
+                            .debug_selector(|| "viewer-image-layers".into())
+                            .absolute()
+                            .left(px(position.0 + self.swipe_offset))
+                            .top(px(position.1))
+                            .w(px(size.0))
+                            .h(px(size.1))
+                            .child(img(base).size_full().object_fit(ObjectFit::Contain))
+                            .when_some(preview.filter(|_| thumbnail.is_some()), |d, preview| {
+                                d.child(
+                                    img(preview)
+                                        .absolute()
+                                        .inset_0()
+                                        .size_full()
+                                        .object_fit(ObjectFit::Contain)
+                                        .with_animation(
+                                            SharedString::from(format!(
+                                                "upgrade-{}",
+                                                photo.fingerprint
+                                            )),
+                                            Animation::new(Duration::from_millis(140)),
+                                            |image, t| image.opacity(t),
+                                        ),
+                                )
+                            })
                             .into_any_element()
-                        })
-                        .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, w, cx| {
-                            if this.modal.is_some() {
-                                return;
-                            }
-                            let delta = e.delta.pixel_delta(px(28.));
-                            if e.modifiers.platform || e.modifiers.control {
-                                let at = e.position - this.viewer_bounds.center();
-                                this.viewport.set_zoom(
-                                    this.viewport.zoom * (f32::from(delta.y) * 0.006).exp(),
-                                    (at.x.into(), at.y.into()),
-                                );
-                                this.sync_zoom(w, cx);
-                            } else if e.modifiers.shift {
-                                let horizontal = if delta.x != px(0.) { delta.x } else { delta.y };
-                                this.viewport.translate(horizontal.into(), 0.);
+                    } else {
+                        kit::empty(
+                            "photos",
+                            if self
+                                .failed
+                                .contains(&format!("{}-preview", photo.fingerprint))
+                            {
+                                "Preview unavailable"
                             } else {
-                                this.viewport.translate(delta.x.into(), delta.y.into());
+                                "Loading preview…"
+                            },
+                            "",
+                            c,
+                        )
+                        .into_any_element()
+                    })
+                    .when(self.swipe_offset.abs() > 0.1, |d| {
+                        let photos = self.visible(cx);
+                        let neighbor = if self.swipe_offset < 0. {
+                            viewer_index.checked_add(1)
+                        } else {
+                            viewer_index.checked_sub(1)
+                        };
+                        if let Some(photo) =
+                            neighbor.and_then(|i| photos.get(&self.library, i)).cloned()
+                        {
+                            self.request_image(photo.as_ref().clone(), false, cx);
+                            if let Some(path) = self.thumbnails.get(&photo.fingerprint).cloned() {
+                                return d.child(
+                                    img(Arc::<std::path::Path>::from(path))
+                                        .image_cache(&self.render_cache)
+                                        .absolute()
+                                        .left(px(self.swipe_offset
+                                            + if self.swipe_offset < 0. {
+                                                self.viewport.viewport.0
+                                            } else {
+                                                -self.viewport.viewport.0
+                                            }))
+                                        .top_0()
+                                        .size_full()
+                                        .object_fit(ObjectFit::Contain),
+                                );
                             }
+                        }
+                        d
+                    })
+                    .child(
+                        ui::button("previous-photo", c, false, true)
+                            .size(px(42.))
+                            .px_0()
+                            .absolute()
+                            .left_3()
+                            .top(relative(0.5))
+                            .rounded_full()
+                            .bg(rgba(0x15181dbb))
+                            .opacity(if can_previous { 1. } else { 0.3 })
+                            .child(kit::glyph("back", 22., 0xffffff))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                cx.stop_propagation();
+                                if can_previous {
+                                    this.step(-1, w, cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        ui::button("next-photo", c, false, true)
+                            .size(px(42.))
+                            .px_0()
+                            .absolute()
+                            .right_3()
+                            .top(relative(0.5))
+                            .rounded_full()
+                            .bg(rgba(0x15181dbb))
+                            .opacity(if can_next { 1. } else { 0.3 })
+                            .child(kit::glyph("next", 22., 0xffffff))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                cx.stop_propagation();
+                                if can_next {
+                                    this.step(1, w, cx);
+                                }
+                            })),
+                    )
+                    .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, w, cx| {
+                        if this.modal.is_some() {
+                            return;
+                        }
+                        let delta = e.delta.pixel_delta(px(28.));
+                        if e.modifiers.platform || e.modifiers.control {
+                            let at = e.position - this.viewer_bounds.center();
+                            this.viewport.set_zoom(
+                                this.viewport.zoom * (f32::from(delta.y) * 0.006).exp(),
+                                (at.x.into(), at.y.into()),
+                            );
+                            this.sync_zoom(w, cx);
+                        } else if !this.can_pan() {
+                            let dx = if e.modifiers.shift && delta.x == px(0.) {
+                                delta.y
+                            } else {
+                                delta.x
+                            };
+                            this.viewer_swipe(
+                                dx.into(),
+                                if e.modifiers.shift {
+                                    0.
+                                } else {
+                                    delta.y.into()
+                                },
+                                e.touch_phase,
+                                w,
+                                cx,
+                            );
+                        } else if e.modifiers.shift {
+                            let horizontal = if delta.x != px(0.) { delta.x } else { delta.y };
+                            this.viewport.translate(horizontal.into(), 0.);
+                        } else {
+                            this.viewport.translate(delta.x.into(), delta.y.into());
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, e: &MouseDownEvent, w, cx| {
+                            if this.can_pan() {
+                                this.pan_start = Some(e.position);
+                            }
+                            this.focus.focus(w);
                             cx.stop_propagation();
                             cx.notify();
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, e: &MouseDownEvent, w, cx| {
-                                this.pan_start = Some(e.position);
-                                this.focus.focus(w);
-                                cx.stop_propagation();
-                                cx.notify();
-                            }),
-                        )
-                        .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
-                            if e.dragging()
-                                && let Some(previous) = this.pan_start
-                            {
-                                let delta = e.position - previous;
-                                this.viewport.translate(delta.x.into(), delta.y.into());
-                                this.pan_start = Some(e.position);
-                                cx.notify();
-                            }
-                        }))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.pan_start = None;
-                                cx.notify();
-                            }),
-                        )
-                        .on_mouse_up_out(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.pan_start = None;
-                                cx.notify();
-                            }),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(|this, e: &MouseDownEvent, _, cx| {
-                                this.menu = Some(e.position);
-                                cx.notify();
-                            }),
-                        ),
-                )
-                .child(
-                    div()
-                        .h(px(30.))
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(11.))
-                        .text_color(rgb(c.muted))
-                        .child(format!(
-                            "{} × {}  ·  {}",
-                            photo.width,
-                            photo.height,
-                            photo.modified.format("%B %-d, %Y")
-                        )),
-                );
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
+                        if e.dragging()
+                            && let Some(previous) = this.pan_start
+                        {
+                            let delta = e.position - previous;
+                            this.viewport.translate(delta.x.into(), delta.y.into());
+                            this.pan_start = Some(e.position);
+                            cx.notify();
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.pan_start = None;
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.pan_start = None;
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                            this.menu = Some(e.position);
+                            cx.notify();
+                        }),
+                    ),
+            );
         }
         let _ = w;
         view
@@ -2203,22 +3113,63 @@ impl PhotosApp {
         }
         for (i, source) in self.preferences.sources.iter().enumerate() {
             let source = source.clone();
+            let remove = source.clone();
+            let count = self.preferences.catalog_counts.get(&source.path).copied();
             content = content.child(
-                ui::button(
-                    SharedString::from(format!("saved-source-{i}")),
-                    c,
-                    false,
-                    !self.busy,
-                )
-                .w_full()
-                .h_auto()
-                .py_3()
-                .justify_start()
-                .child(kit::glyph("drive", 20., c.accent))
-                .child(div().flex_1().min_w_0().truncate().child(source.label()))
-                .on_click(cx.listener(move |this, _, w, cx| this.connect(source.clone(), w, cx))),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        ui::button(
+                            SharedString::from(format!("saved-source-{i}")),
+                            c,
+                            false,
+                            true,
+                        )
+                        .flex_1()
+                        .min_w_0()
+                        .h_auto()
+                        .py_3()
+                        .justify_start()
+                        .child(kit::glyph("drive", 20., c.accent))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().truncate().child(source.label()))
+                                .when_some(count, |d, count| {
+                                    d.child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(rgb(c.muted))
+                                            .child(format!("{count} photos")),
+                                    )
+                                }),
+                        )
+                        .on_click(
+                            cx.listener(move |this, _, w, cx| this.connect(source.clone(), w, cx)),
+                        ),
+                    )
+                    .child(
+                        ui::button(
+                            SharedString::from(format!("remove-library-{i}")),
+                            c,
+                            false,
+                            true,
+                        )
+                        .text_color(rgb(c.danger))
+                        .child("Remove")
+                        .on_click(cx.listener(move |this, _, w, cx| {
+                            this.remove_library(remove.clone(), w, cx)
+                        })),
+                    ),
             );
         }
+        content =
+            content.child(div().text_size(px(11.)).text_color(rgb(c.muted)).child(
+                "Removing a library disconnects it. Your original photos stay where they are.",
+            ));
         content
     }
     fn modal_view(
@@ -2229,7 +3180,7 @@ impl PhotosApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let title = match modal {
-            Modal::Sources => "Libraries & appearance",
+            Modal::Sources => "Settings",
             Modal::Browse => "Library & albums",
             Modal::Album => "New album",
             Modal::AddToAlbum => "Add to album",
@@ -2246,9 +3197,9 @@ impl PhotosApp {
             .gap_3();
         match modal {
             Modal::Sources => {
-                if !self.settings_appearance {
+                if self.settings_page == 0 {
                     content = content.child(self.source_choices(w, c, cx));
-                } else {
+                } else if self.settings_page == 1 {
                     content = content.child(kit::panel_heading(
                         "Appearance",
                         "Choose how Photos looks on this device.",
@@ -2275,6 +3226,84 @@ impl PhotosApp {
                             )),
                         );
                     }
+                    content = content
+                        .child(
+                            div()
+                                .mt_3()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Accent color"),
+                        )
+                        .child(div().flex().flex_wrap().gap_3().children(Accent::ALL.map(
+                            |accent| {
+                                let color = Colors::new(
+                                    matches!(self.preferences.appearance.as_str(), "dark")
+                                        || self.preferences.appearance != "light"
+                                            && ui::system_dark(w),
+                                    accent,
+                                );
+                                let active = self.accent() == accent;
+                                let id = format!("accent-{}", accent.key());
+                                div()
+                                    .id(SharedString::from(id.clone()))
+                                    .debug_selector(move || id)
+                                    .size(px(32.))
+                                    .rounded_full()
+                                    .p(px(3.))
+                                    .border_2()
+                                    .border_color(rgb(if active {
+                                        color.accent
+                                    } else {
+                                        c.surface
+                                    }))
+                                    .cursor_pointer()
+                                    .focusable()
+                                    .tab_index(0)
+                                    .child(
+                                        div()
+                                            .size_full()
+                                            .rounded_full()
+                                            .bg(rgb(color.accent))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .when(active, |d| {
+                                                d.child(kit::glyph("check", 12., color.on_accent))
+                                            }),
+                                    )
+                                    .on_click(cx.listener(move |this, _, w, cx| {
+                                        this.set_accent(accent, w, cx)
+                                    }))
+                                    .on_key_down(cx.listener(
+                                        move |this, event: &KeyDownEvent, w, cx| {
+                                            if matches!(
+                                                event.keystroke.key.as_str(),
+                                                "enter" | "space"
+                                            ) {
+                                                cx.stop_propagation();
+                                                this.set_accent(accent, w, cx);
+                                            }
+                                        },
+                                    ))
+                            },
+                        )))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(c.muted))
+                                .child(format!(
+                                    "{} · buttons, selection and highlights",
+                                    self.accent().label()
+                                )),
+                        );
+                } else {
+                    content = content.child(kit::panel_heading("Behavior", "Choose how you browse your library.",c))
+                        .child(div().flex().items_center().gap_4()
+                            .child(div().flex_1().child(div().text_size(px(14.)).child("Browse from bottom to top"))
+                                .child(div().mt_1().text_size(px(12.)).text_color(rgb(c.muted)).child("Start at the newest photos at the bottom. Scroll up to go back in time.")))
+                            .child(div().id("bottom-to-top-setting").debug_selector(|| "bottom-to-top-setting".into()).child(Switch::new("bottom-to-top")
+                                .checked(self.preferences.bottom_to_top)
+                                .on_click(cx.listener(|this,value: &bool,_,cx| this.set_scroll_direction(*value,cx))))));
                 }
             }
             Modal::DeleteConfirm => {
@@ -2393,11 +3422,11 @@ impl PhotosApp {
                         "folder",
                         "Libraries",
                         None,
-                        !self.settings_appearance,
+                        self.settings_page == 0,
                         c,
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.settings_appearance = false;
+                        this.settings_page = 0;
                         cx.notify();
                     })),
                 )
@@ -2407,11 +3436,25 @@ impl PhotosApp {
                         "eye",
                         "Appearance",
                         None,
-                        self.settings_appearance,
+                        self.settings_page == 1,
                         c,
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.settings_appearance = true;
+                        this.settings_page = 1;
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    kit::nav_item(
+                        "settings-behavior",
+                        "settings",
+                        "Behavior",
+                        None,
+                        self.settings_page == 2,
+                        c,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.settings_page = 2;
                         cx.notify();
                     })),
                 );
@@ -2580,7 +3623,7 @@ impl Render for PhotosApp {
                         this.focus.focus(w);
                         cx.stop_propagation();
                         cx.notify();
-                    } else if event.keystroke.key == "tab" && this.provider_step.is_none() {
+                    } else if event.keystroke.key == "tab" && this.modal == Some(Modal::Album) {
                         if this.modal == Some(Modal::Album) {
                             this.name.update(cx, |e, cx| e.focus(w, cx));
                         } else {
@@ -2607,7 +3650,11 @@ impl Render for PhotosApp {
             }))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
                 if this.modal.is_none() {
-                    this.selected = this.visible(cx).iter().map(|p| p.id.clone()).collect();
+                    this.selected = this
+                        .visible(cx)
+                        .iter(&this.library)
+                        .map(|p| p.id.clone())
+                        .collect();
                     cx.notify();
                 }
             }))
@@ -2674,10 +3721,23 @@ impl Render for PhotosApp {
                 div()
                     .ml_2()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("Photos"),
+                    .when(width >= 480., |d| d.child("Photos")),
             )
             .child(div().flex_1());
-        if self.driver.is_some() {
+        if let Some((label, progress)) = self.loading_status() {
+            bar = bar.child(progress::indicator(label, progress, width >= 700., c));
+        }
+        if self.page_failed {
+            bar = bar.child(
+                kit::tool("retry-catalog", "refresh", "Retry library catalog", c).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.page_failed = false;
+                        this.load_more(cx);
+                    }),
+                ),
+            );
+        }
+        if self.driver.is_some() && !self.page_failed {
             bar = bar.child(
                 kit::tool("refresh-source", "refresh", "Refresh library", c).on_click(cx.listener(
                     |this, _, w, cx| {
@@ -2694,16 +3754,18 @@ impl Render for PhotosApp {
                     .on_click(cx.listener(|this, _, w, cx| this.import_picker(w, cx))),
             );
         }
-        bar = bar
-            .child(ui::toolbar_separator(c))
-            .child(
-                kit::tool("help", "info", "Photos Help", c)
-                    .on_click(cx.listener(|this, _, w, cx| this.open_modal(Modal::Help, w, cx))),
-            )
-            .child(
-                kit::tool("settings", "settings", "Libraries & appearance · ⌘,", c)
-                    .on_click(cx.listener(|this, _, w, cx| this.open_modal(Modal::Sources, w, cx))),
-            );
+        bar =
+            bar.child(ui::toolbar_separator(c))
+                .when(width >= 520., |d| {
+                    d.child(kit::tool("help", "info", "Photos Help", c).on_click(
+                        cx.listener(|this, _, w, cx| this.open_modal(Modal::Help, w, cx)),
+                    ))
+                })
+                .child(
+                    kit::tool("settings", "settings", "Libraries & appearance · ⌘,", c).on_click(
+                        cx.listener(|this, _, w, cx| this.open_modal(Modal::Sources, w, cx)),
+                    ),
+                );
         root = root.child(bar);
         if let Some(error) = &self.error {
             root = root.child(
@@ -2783,16 +3845,14 @@ impl Render for PhotosApp {
                             .when(available >= 500., |d| {
                                 d.child(
                                     kit::tool("smaller-tiles", "minus", "Smaller thumbnails", c)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.tile_size = (this.tile_size - 32.).max(96.);
-                                            cx.notify();
+                                        .on_click(cx.listener(|this, _, w, cx| {
+                                            this.gallery_step(false, w, cx);
                                         })),
                                 )
                                 .child(
                                     kit::tool("larger-tiles", "plus", "Larger thumbnails", c)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.tile_size = (this.tile_size + 32.).min(320.);
-                                            cx.notify();
+                                        .on_click(cx.listener(|this, _, w, cx| {
+                                            this.gallery_step(true, w, cx);
                                         })),
                                 )
                             })
@@ -2827,6 +3887,8 @@ impl Render for PhotosApp {
                     .id("photo-status")
                     .debug_selector(|| "photo-status".into())
                     .flex_shrink_0()
+                    .relative()
+                    .bg(rgb(c.surface))
                     .min_h(px(38.))
                     .px_3()
                     .py_1()
@@ -2838,13 +3900,38 @@ impl Render for PhotosApp {
                     .border_color(rgb(c.border))
                     .text_size(px(11.))
                     .text_color(rgb(c.muted))
-                    .child(div().flex_1().min_w(px(70.)).truncate().child(
-                        if self.selected.is_empty() {
-                            self.notice.clone()
-                        } else {
-                            format!("{} selected", self.selected.len())
-                        },
-                    ))
+                    .when(self.viewer.is_some(), |d| {
+                        let photo = self.current().unwrap();
+                        d.child(
+                            div()
+                                .id("viewer-file-info")
+                                .debug_selector(|| "viewer-file-info".into())
+                                .absolute()
+                                .left(relative(0.25))
+                                .w(relative(0.5))
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .gap_3()
+                                .child(div().truncate().min_w_0().child(photo.name))
+                                .child(div().w(px(1.)).h(px(14.)).flex_shrink_0().bg(rgb(c.border)))
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .child(format!("{} × {}", photo.width, photo.height)),
+                                ),
+                        )
+                    })
+                    .when(self.viewer.is_none(), |d| {
+                        d.child(div().flex_1().min_w(px(70.)).truncate().child(
+                            if self.selected.is_empty() {
+                                self.notice.clone()
+                            } else {
+                                format!("{} selected", self.selected.len())
+                            },
+                        ))
+                    })
                     .when(!self.selected.is_empty(), |d| {
                         d.child(
                             kit::tool("favorite", "heart", "Favorite · F", c)
@@ -2860,6 +3947,7 @@ impl Render for PhotosApp {
                                 }),
                             ),
                         )
+                        .when(self.viewer.is_some(), |d| d.child(div().flex_1()))
                         .child(
                             kit::tool("export", "export", "Export originals", c)
                                 .on_click(cx.listener(|this, _, w, cx| this.export_picker(w, cx))),

@@ -326,7 +326,7 @@ mod remote {
                 if body["page"] == 1 {
                     (
                         200,
-                        json!({"assets": {"items": [fixture(id)], "nextPage": "2", "total": 2}})
+                        json!({"assets": {"items": [fixture(id)], "nextPage": "2", "nextCursor": null, "total": 2}})
                             .to_string()
                             .into_bytes(),
                     )

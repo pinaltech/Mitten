@@ -139,24 +139,27 @@ impl Remote {
                     .into(),
             }));
         }
-        let next = if assets.get("nextCursor").is_some() {
-            assets["nextCursor"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .map(|s| format!("cursor:{s}"))
-        } else {
-            assets["nextPage"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-        };
+        let next = assets["nextCursor"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("cursor:{s}"))
+            .or_else(|| {
+                assets["nextPage"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            });
+        let total = assets["total"]
+            .as_u64()
+            .map(|n| n as usize)
+            .filter(|&n| n >= photos.len());
         Ok(PhotoPage {
             library: Library {
                 photos,
                 albums: Default::default(),
             },
             next,
-            total: assets["total"].as_u64().map(|n| n as usize),
+            total,
         })
     }
     fn scope(&self) -> Result<Url> {

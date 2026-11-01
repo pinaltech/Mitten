@@ -7,6 +7,48 @@ fn image(path: &Path, color: u8) {
 }
 
 #[test]
+fn appearance_and_catalog_counts_persist_and_removed_libraries_do_not_delete_photos() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = Source {
+        driver: "local-folder".into(),
+        path: dir.path().join("first"),
+    };
+    let second = Source {
+        driver: "local-folder".into(),
+        path: dir.path().join("second"),
+    };
+    fs::create_dir(&first.path).unwrap();
+    fs::create_dir(&second.path).unwrap();
+    image(&first.path.join("original.png"), 80);
+    let settings = dir.path().join("profile/settings.json");
+    let mut prefs = Preferences::default();
+    assert_eq!(prefs.accent, "orange");
+    assert!(prefs.bottom_to_top);
+    prefs.connect(first.clone());
+    prefs.connect(second.clone());
+    prefs.catalog_counts.insert(first.path.clone(), 1);
+    prefs.catalog_counts.insert(second.path.clone(), 2);
+    prefs.accent = "purple".into();
+    prefs.bottom_to_top = false;
+    prefs.save(&settings).unwrap();
+    let mut prefs = Preferences::load(&settings).unwrap();
+    assert_eq!(prefs.accent, "purple");
+    assert!(!prefs.bottom_to_top);
+    prefs.remove(&second);
+    assert_eq!(prefs.active.as_ref(), Some(&first.path));
+    assert!(!prefs.catalog_counts.contains_key(&second.path));
+    prefs.remove(&first);
+    prefs.save(&settings).unwrap();
+    let prefs = Preferences::load(&settings).unwrap();
+    assert!(prefs.sources.is_empty() && prefs.active.is_none() && prefs.catalog_counts.is_empty());
+    assert!(first.path.join("original.png").exists());
+    // Old settings get the default accent and an empty catalog without migration.
+    fs::write(&settings, br#"{"sources":[],"active":null}"#).unwrap();
+    assert_eq!(Preferences::load(&settings).unwrap().accent, "orange");
+    assert!(Preferences::load(&settings).unwrap().bottom_to_top);
+}
+
+#[test]
 fn library_references_originals_and_ignores_its_private_cache() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir(dir.path().join("Vacation")).unwrap();

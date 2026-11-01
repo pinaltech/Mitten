@@ -27,12 +27,36 @@ impl Source {
             .into_owned()
     }
 }
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Preferences {
     pub sources: Vec<Source>,
     pub active: Option<PathBuf>,
     #[serde(default)]
     pub appearance: String,
+    #[serde(default = "default_accent")]
+    pub accent: String,
+    #[serde(default = "default_bottom_to_top")]
+    pub bottom_to_top: bool,
+    #[serde(default)]
+    pub catalog_counts: BTreeMap<PathBuf, usize>,
+}
+fn default_bottom_to_top() -> bool {
+    true
+}
+fn default_accent() -> String {
+    "orange".into()
+}
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            sources: vec![],
+            active: None,
+            appearance: "system".into(),
+            accent: default_accent(),
+            catalog_counts: BTreeMap::new(),
+            bottom_to_top: true,
+        }
+    }
 }
 impl Preferences {
     pub fn load(path: &Path) -> Result<Self> {
@@ -55,6 +79,13 @@ impl Preferences {
         self.active = Some(source.path.clone());
         if !self.sources.contains(&source) {
             self.sources.push(source);
+        }
+    }
+    pub fn remove(&mut self, source: &Source) {
+        self.sources.retain(|s| s != source);
+        self.catalog_counts.remove(&source.path);
+        if self.active.as_ref() == Some(&source.path) {
+            self.active = self.sources.first().map(|s| s.path.clone());
         }
     }
 }
