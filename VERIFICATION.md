@@ -1,5 +1,42 @@
 # Verification
 
+## Original drag export and minimum viewer zoom — October 31, 2026
+
+- **46 tests pass:** six geometry/cache tests, fourteen GPUI interaction tests,
+  two native drag tests, three portable export tests, one privacy-packaging test,
+  nine source/protocol tests and eleven storage tests. Formatting and strict
+  all-target Clippy pass. The macOS debug bundle builds, and both embedded and
+  bundled privacy-description checks pass.
+- Linux/Windows x86-64 core and remote-adapter checks pass. Intel macOS core,
+  remote adapters and PhotoKit cross-check successfully; the Intel Objective-C
+  drag bridge compiles with warnings treated as errors. The macOS native UI also
+  checks with PhotoKit and remote features disabled. These are not native
+  Linux/Windows GUI builds or Intel execution tests.
+- Fixed native export from both gallery and fitted viewer. Connected photos
+  supply deferred original-file promises instead of empty local paths. Local
+  files additionally advertise the standard file URL. In-app album drags remain
+  covered by the existing interaction test.
+- Reproduced a native fulfillment stall after Finder accepted the drop: the
+  process sample showed AppKit holding a coordinated write claim while our
+  delegate waited for another claim. The delegate now writes directly. A native
+  regression runs the delegate under an outer coordinated write and verifies
+  exact original bytes. It validates a private pasteboard, not a synthesized
+  end-to-end receiver operation. The user then quit/reopened the rebuilt bundle
+  and confirmed that a real Finder drop creates the file. Automated cross-app
+  release remains unreliable; live PhotoKit/Immich/Nextcloud drag drops were not
+  exercised. See [DRAG_EXPORT.md](docs/DRAG_EXPORT.md).
+- Zoom is constrained to 100–800%. Zooming/pinching out from fit closes the viewer;
+  downward scrolling from fit also closes it. Typed percentages below 100 clamp
+  to fit. Tests cover stopping at fit when zooming down from above it, closing
+  from fit, selected-tile visibility and suppression of trailing gallery zoom.
+  Viewer dragging exports at fit and pans when zoomed. Native review confirmed
+  downward-scroll dismissal and revealing the selected tile using only generated
+  JPEGs and an isolated profile. Physical pinch feel remains unverified.
+- Existing million-photo and dense-grid loading regressions pass. The synthetic
+  million-record catalog plus initial thumbnails completed in about 3.0 seconds;
+  requested originals remain zero during cataloging and scrolling. These tests
+  do not measure a live remote server or production frame rates.
+
 ## Catalog stability, interactive zoom and disappearing thumbnails — October 31, 2026
 
 - **38 tests pass:** six geometry/cache tests, twelve GPUI tests, one PhotoKit

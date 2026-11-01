@@ -8,7 +8,7 @@ autobenches = false
 
 [features]
 default = ["native-ui", "remote", "apple-photos"]
-native-ui = ["dep:desert-ui", "dep:gpui", "dep:gpui-component"]
+native-ui = ["dep:desert-ui", "dep:gpui", "dep:gpui-component", "dep:raw-window-handle"]
 remote = ["dep:reqwest", "dep:reqwest_dav", "dep:tokio", "dep:roxmltree", "dep:keyring"]
 apple-photos = []
 
@@ -38,6 +38,7 @@ roxmltree = { version = "0.21", optional = true }
 keyring = { version = "3.6", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+raw-window-handle = { version = "0.6", optional = true }
 keyring = { version = "3.6", features = ["apple-native"], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]

@@ -294,7 +294,7 @@ fn blank_click_marquee_viewer_zoom_delete_confirmation_and_album_spaces(cx: &mut
     let canvas = bounds(cx, "viewer-canvas");
     cx.simulate_event(ScrollWheelEvent {
         position: canvas.center(),
-        delta: ScrollDelta::Lines(point(0., -3.)),
+        delta: ScrollDelta::Lines(point(0., 3.)),
         ..Default::default()
     });
     frame(cx);
@@ -1271,4 +1271,163 @@ fn final_catalog_page_keeps_latest_photo_frames_fixed_and_waits_for_pinch(cx: &m
         frame(cx);
         app.read_with(cx, |app, _| assert!(app.gallery_motion.is_none()));
     }
+}
+
+#[gpui::test]
+fn viewer_stops_at_fit_and_zoom_out_or_downward_scroll_returns_to_library(cx: &mut TestAppContext) {
+    cx.update(ui::init);
+    let data = tempfile::tempdir().unwrap();
+    for i in 0..8 {
+        image::RgbImage::from_pixel(160, 100, image::Rgb([i * 20, 80, 100]))
+            .save(data.path().join(format!("Photo {i}.png")))
+            .unwrap();
+    }
+    let driver: Arc<dyn PhotosDriver> = Arc::new(storage::LocalPhotos::open(data.path()).unwrap());
+    let mut entity = None;
+    let window = cx.add_window(|w, cx| {
+        let app = cx.new(|cx| {
+            let mut app = PhotosApp::new(data.path().join("profile/settings.json"), w, cx);
+            app.finish_connection(Ok((driver.clone(), driver.page(None).unwrap())), w, cx);
+            app
+        });
+        entity = Some(app.clone());
+        Root::new(app, w, cx)
+    });
+    let app = entity.unwrap();
+    let cx = VisualTestContext::from_window(window.into(), cx).into_mut();
+    cx.simulate_resize(size(px(1060.), px(700.)));
+    frame(cx);
+    app.update_in(cx, |app, w, cx| {
+        app.select(3, true, Modifiers::none(), w, cx);
+        app.set_viewer_zoom(0.2, (0., 0.), false, w, cx);
+        assert_eq!(app.viewport.zoom, 1.);
+        assert!(app.viewer.is_some());
+        app.set_viewer_zoom(2., (0., 0.), true, w, cx);
+        app.set_viewer_zoom(0.2, (0., 0.), true, w, cx);
+        assert_eq!(app.viewport.zoom, 1.);
+        assert!(
+            app.viewer.is_some(),
+            "zooming down from above fit stops at 100% first"
+        );
+        app.set_viewer_zoom(0.99, (0., 0.), true, w, cx);
+        assert!(app.viewer.is_none());
+        assert_eq!(app.viewport.zoom, 1.);
+    });
+    frame(cx);
+    assert!(cx.debug_bounds("photo-tile-3").is_some());
+    let grid = bounds(cx, "photo-grid");
+    let before = app.read_with(cx, |app, _| app.gallery_zoom);
+    cx.simulate_event(ScrollWheelEvent {
+        position: grid.center(),
+        delta: ScrollDelta::Pixels(point(px(0.), px(-100.))),
+        modifiers: Modifiers {
+            control: true,
+            ..Default::default()
+        },
+        touch_phase: TouchPhase::Moved,
+    });
+    frame(cx);
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.gallery_zoom, before);
+        assert!(
+            app.gallery_pinch.is_none(),
+            "closing gesture momentum must not zoom the gallery"
+        );
+    });
+    app.update_in(cx, |app, w, cx| {
+        app.select(3, true, Modifiers::none(), w, cx)
+    });
+    frame(cx);
+    let canvas = bounds(cx, "viewer-canvas");
+    cx.simulate_event(ScrollWheelEvent {
+        position: canvas.center(),
+        delta: ScrollDelta::Pixels(point(px(0.), px(-30.))),
+        touch_phase: TouchPhase::Started,
+        ..Default::default()
+    });
+    frame(cx);
+    app.read_with(cx, |app, _| {
+        assert!(app.viewer.is_none());
+        assert_eq!(app.selected.len(), 1);
+        assert_eq!(app.viewport.zoom, 1.);
+    });
+    app.update_in(cx, |app, w, cx| {
+        app.open_selected(w, cx);
+        app.zoom_by(1. / 1.2, w, cx);
+        assert!(
+            app.viewer.is_none(),
+            "the zoom-out button at fit also returns to the library"
+        );
+    });
+}
+
+#[gpui::test]
+fn viewer_exports_by_dragging_at_fit_and_keeps_dragging_for_panning_when_zoomed(
+    cx: &mut TestAppContext,
+) {
+    cx.update(ui::init);
+    let data = tempfile::tempdir().unwrap();
+    image::RgbImage::from_pixel(160, 100, image::Rgb([20, 80, 100]))
+        .save(data.path().join("Photo.png"))
+        .unwrap();
+    let driver: Arc<dyn PhotosDriver> = Arc::new(storage::LocalPhotos::open(data.path()).unwrap());
+    let mut entity = None;
+    let window = cx.add_window(|w, cx| {
+        let app = cx.new(|cx| {
+            let mut app = PhotosApp::new(data.path().join("profile/settings.json"), w, cx);
+            app.finish_connection(Ok((driver.clone(), driver.page(None).unwrap())), w, cx);
+            app
+        });
+        entity = Some(app.clone());
+        Root::new(app, w, cx)
+    });
+    let app = entity.unwrap();
+    let cx = VisualTestContext::from_window(window.into(), cx).into_mut();
+    cx.simulate_resize(size(px(1060.), px(700.)));
+    frame(cx);
+    app.update_in(cx, |app, w, cx| {
+        app.select(0, true, Modifiers::none(), w, cx)
+    });
+    frame(cx);
+    let at = bounds(cx, "viewer-canvas").center();
+    cx.simulate_event(MouseDownEvent {
+        position: at,
+        button: MouseButton::Left,
+        ..Default::default()
+    });
+    cx.simulate_event(MouseMoveEvent {
+        position: at + point(px(35.), px(0.)),
+        pressed_button: Some(MouseButton::Left),
+        ..Default::default()
+    });
+    frame(cx);
+    assert!(
+        cx.read(|cx| cx.has_active_drag()),
+        "the fitted viewer needs a file-export drag source"
+    );
+    cx.simulate_event(MouseUpEvent {
+        position: at,
+        button: MouseButton::Left,
+        ..Default::default()
+    });
+    frame(cx);
+    app.update_in(cx, |app, w, cx| app.zoom_by(2., w, cx));
+    frame(cx);
+    let at = bounds(cx, "viewer-canvas").center();
+    cx.simulate_event(MouseDownEvent {
+        position: at,
+        button: MouseButton::Left,
+        ..Default::default()
+    });
+    cx.simulate_event(MouseMoveEvent {
+        position: at + point(px(35.), px(0.)),
+        pressed_button: Some(MouseButton::Left),
+        ..Default::default()
+    });
+    frame(cx);
+    assert!(
+        !cx.read(|cx| cx.has_active_drag()),
+        "a zoomed image should pan instead of exporting"
+    );
+    app.read_with(cx, |app, _| assert_ne!(app.viewport.pan, (0., 0.)));
 }

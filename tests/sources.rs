@@ -537,3 +537,40 @@ mod remote {
         }
     }
 }
+
+#[test]
+fn promised_connected_originals_are_fetched_only_on_fulfillment() {
+    let source = tempfile::tempdir().unwrap();
+    let receiver = tempfile::tempdir().unwrap();
+    let originals = Arc::new(AtomicUsize::new(0));
+    let driver = ConnectedPhotos::new(
+        Source {
+            driver: "synthetic".into(),
+            path: source.path().to_owned(),
+        },
+        Box::new(MillionPhotos {
+            thumbnails: Arc::default(),
+            previews: Arc::default(),
+            originals: originals.clone(),
+        }),
+    )
+    .unwrap();
+    let photos = driver.page(None).unwrap().library.photos;
+    assert!(photos[0].path.as_os_str().is_empty());
+    let names = desert_photos::drag_export::filenames(photos[..2].iter().map(|p| p.name.as_str()));
+    assert_eq!(names.len(), 2);
+    assert_eq!(originals.load(Ordering::SeqCst), 0);
+    let destination = receiver.path().join("Receiver's renamed file.png");
+    desert_photos::drag_export::write_original(&driver, &photos[0].id, &destination).unwrap();
+    assert_eq!(originals.load(Ordering::SeqCst), 1);
+    assert_eq!(fs::read(&destination).unwrap(), b"original bytes");
+    assert!(
+        desert_photos::drag_export::write_original(&driver, &photos[0].id, &destination).is_err()
+    );
+    assert_eq!(
+        originals.load(Ordering::SeqCst),
+        1,
+        "an occupied destination must fail before downloading another original"
+    );
+    assert_eq!(fs::read_dir(receiver.path()).unwrap().count(), 1);
+}

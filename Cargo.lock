@@ -1399,6 +1399,7 @@ dependencies = [
  "gpui-component",
  "image",
  "keyring",
+ "raw-window-handle",
  "reqwest",
  "reqwest_dav",
  "roxmltree 0.21.2",

@@ -59,6 +59,8 @@ enum Modal {
 struct DragPhotos {
     ids: Arc<RefCell<Vec<String>>>,
     seed: String,
+    photos: Arc<RefCell<Vec<Arc<Photo>>>>,
+    driver: Arc<dyn PhotosDriver>,
     source: PathBuf,
     paths: Arc<RefCell<Vec<PathBuf>>>,
     offset: Point<Pixels>,
@@ -101,6 +103,7 @@ struct Marquee {
 }
 mod assets;
 mod image_cache;
+mod native_drag;
 mod photo_view;
 mod progress;
 fn provider_logo(provider: ProviderKind, c: Colors) -> AnyElement {
@@ -210,6 +213,9 @@ pub struct PhotosApp {
     catalog_epoch: u64,
     viewport: ui::image_viewport::ImageViewport,
     viewer_bounds: Bounds<Pixels>,
+    dismiss_scroll: f32,
+    dismiss_scroll_last: Option<std::time::Instant>,
+    dismiss_guard: Option<std::time::Instant>,
     pan_start: Option<Point<Pixels>>,
     zoom_input: Entity<InputState>,
     menu: Option<Point<Pixels>>,
@@ -255,7 +261,7 @@ impl PhotosApp {
                         .trim_end_matches('%')
                         .parse::<f32>();
                     if let Ok(value) = value {
-                        this.viewport.set_zoom(value / 100., (0., 0.));
+                        this.set_viewer_zoom(value / 100., (0., 0.), false, w, cx);
                     }
                     this.sync_zoom(w, cx);
                     if matches!(event, InputEvent::PressEnter { .. }) {
@@ -356,6 +362,9 @@ impl PhotosApp {
             catalog_epoch: 0,
             viewport: Default::default(),
             viewer_bounds: Bounds::default(),
+            dismiss_scroll: 0.,
+            dismiss_scroll_last: None,
+            dismiss_guard: None,
             pan_start: None,
             zoom_input,
             menu: None,
@@ -425,13 +434,18 @@ impl PhotosApp {
                     .update_in(cx, |this, w, cx| {
                         let delta = ui::native_transfer::take_magnification(w);
                         if delta != 0. && this.modal.is_none() {
+                            if this.block_dismissed_gesture(false) {
+                                return;
+                            }
                             if this.viewer.is_some() {
                                 let at = w.mouse_position() - this.viewer_bounds.center();
-                                this.viewport.set_zoom(
+                                this.set_viewer_zoom(
                                     this.viewport.zoom * (1. + delta).max(0.1),
                                     (at.x.into(), at.y.into()),
+                                    true,
+                                    w,
+                                    cx,
                                 );
-                                this.sync_zoom(w, cx);
                             } else {
                                 this.pinch_gallery(delta * 2.6, w.mouse_position(), false, cx);
                             }
@@ -1153,6 +1167,7 @@ impl PhotosApp {
         if double {
             self.selected = BTreeSet::from([photo.id.clone()]);
             self.viewer = Some(photo.id.clone());
+            self.dismiss_guard = None;
             self.decoded_preview = None;
             self.viewport.reset();
             self.pan_start = None;
@@ -1170,6 +1185,7 @@ impl PhotosApp {
         if let Some(photo) = self.current() {
             self.selected = BTreeSet::from([photo.id.clone()]);
             self.viewer = Some(photo.id.clone());
+            self.dismiss_guard = None;
             self.decoded_preview = None;
             self.viewport.reset();
             self.pan_start = None;
@@ -1199,6 +1215,79 @@ impl PhotosApp {
         let next = (index as isize + amount).clamp(0, photos.len() as isize - 1) as usize;
         let viewer = self.viewer.is_some();
         self.select(next, viewer, Modifiers::none(), w, cx);
+    }
+    fn close_viewer(&mut self, gesture: bool, w: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.viewer.take() {
+            let photos = self.visible(cx);
+            if let Some(index) = self.photo_index.get(&id).and_then(|&i| photos.position(i)) {
+                let layout = GalleryLayout::new(self.gallery_width, self.gallery_zoom)
+                    .with_count(photos.len(), self.preferences.bottom_to_top);
+                self.gallery_reset = false;
+                self.gallery_restore = None;
+                self.scroll.scroll_to_item(
+                    (index + layout.leading) / layout.block_len,
+                    ScrollStrategy::Center,
+                );
+            }
+        }
+        self.viewport.reset();
+        self.sync_zoom(w, cx);
+        self.dismiss_guard = gesture.then(std::time::Instant::now);
+        self.focus.focus(w);
+        cx.notify();
+    }
+    fn block_dismissed_gesture(&mut self, started: bool) -> bool {
+        let Some(last) = self.dismiss_guard else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        if started || now.duration_since(last) > Duration::from_millis(180) {
+            self.dismiss_guard = None;
+            false
+        } else {
+            self.dismiss_guard = Some(now);
+            true
+        }
+    }
+    fn set_viewer_zoom(
+        &mut self,
+        target: f32,
+        anchor: (f32, f32),
+        dismiss: bool,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.viewer.is_none() || !target.is_finite() {
+            return;
+        }
+        if dismiss && self.viewport.zoom <= 1.0001 && target < 1. {
+            self.close_viewer(true, w, cx);
+            return;
+        }
+        self.viewport.set_zoom(target.clamp(1., 8.), anchor);
+        self.sync_zoom(w, cx);
+        cx.notify();
+    }
+    fn scroll_to_close(
+        &mut self,
+        dy: f32,
+        phase: TouchPhase,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let now = std::time::Instant::now();
+        if matches!(phase, TouchPhase::Started)
+            || self
+                .dismiss_scroll_last
+                .is_none_or(|last| now.duration_since(last) > Duration::from_millis(220))
+        {
+            self.dismiss_scroll = 0.;
+        }
+        self.dismiss_scroll_last = Some(now);
+        self.dismiss_scroll = (self.dismiss_scroll - dy).max(0.);
+        if self.dismiss_scroll >= 18. {
+            self.close_viewer(true, w, cx);
+        }
     }
     fn can_pan(&self) -> bool {
         let fit = self.viewport.fit_size();
@@ -1337,6 +1426,8 @@ impl PhotosApp {
         self.swipe_active = false;
         self.swipe_settling = false;
         self.pan_start = None;
+        self.dismiss_scroll = 0.;
+        self.dismiss_scroll_last = None;
         self.zoom_input.update(cx, |e, cx| {
             e.set_value(format!("{:.0}%", self.viewport.zoom * 100.), w, cx)
         });
@@ -1345,10 +1436,7 @@ impl PhotosApp {
         if self.viewer.is_none() || self.modal.is_some() {
             return;
         }
-        self.viewport
-            .set_zoom(self.viewport.zoom * factor, (0., 0.));
-        self.sync_zoom(w, cx);
-        cx.notify();
+        self.set_viewer_zoom(self.viewport.zoom * factor, (0., 0.), true, w, cx);
     }
     fn update_marquee(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let handle = &self.scroll.0.borrow().base_handle;
@@ -1801,6 +1889,62 @@ impl PhotosApp {
                 );
         side
     }
+    fn prepare_photo_drag(&self, drag: &DragPhotos) {
+        let ids: Vec<String> = if self.selected.contains(&drag.seed) {
+            self.selected.iter().cloned().collect()
+        } else {
+            vec![drag.seed.clone()]
+        };
+        let photos: Vec<_> = ids
+            .iter()
+            .filter_map(|id| {
+                self.photo_index
+                    .get(id)
+                    .and_then(|&i| self.library.photos.get(i))
+                    .cloned()
+            })
+            .collect();
+        *drag.ids.borrow_mut() = ids;
+        *drag.paths.borrow_mut() = photos
+            .iter()
+            .filter(|p| !p.path.as_os_str().is_empty())
+            .map(|p| p.path.clone())
+            .collect();
+        if std::env::var_os("DESERT_PHOTOS_TRACE_DRAGS").is_some() {
+            eprintln!("Photos drag: GPUI prepared {} photos", photos.len());
+        }
+        *drag.photos.borrow_mut() = photos;
+    }
+    fn handoff_photo_drag(
+        &mut self,
+        event: &DragMoveEvent<DragPhotos>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let drag = event.drag(cx).clone();
+        if self.start_external_drag(&drag, event.event.position, w) {
+            Self::finish_external_handoff(w, cx);
+            cx.stop_propagation();
+        }
+    }
+    fn finish_external_handoff(w: &mut Window, cx: &mut App) {
+        // Defer because GPUI sets active_drag after the on_drag constructor.
+        w.defer(cx, |w, cx| {
+            cx.stop_active_drag(w);
+        });
+    }
+
+    fn start_external_drag(&self, drag: &DragPhotos, at: Point<Pixels>, w: &Window) -> bool {
+        if !native_drag::should_handoff(w, at) {
+            return false;
+        }
+        let photos = drag.photos.borrow().clone();
+        let previews = photos
+            .iter()
+            .map(|p| self.thumbnails.peek(&p.fingerprint).cloned())
+            .collect();
+        native_drag::start(w, drag.driver.clone(), photos, previews)
+    }
     fn tile(
         &mut self,
         photo: &Photo,
@@ -1820,6 +1964,8 @@ impl PhotosApp {
         let drag = DragPhotos {
             ids: Default::default(),
             seed: photo.id.clone(),
+            photos: Default::default(),
+            driver: self.driver.as_ref().unwrap().clone(),
             paths: Default::default(),
             source: self.driver.as_ref().unwrap().source().path,
             offset: point(px(0.), px(0.)),
@@ -1941,36 +2087,15 @@ impl PhotosApp {
                         this.select(index, e.click_count() == 2, e.modifiers(), w, cx)
                     }))
                     .on_drag(drag, move |drag, offset, w, cx| {
-                        let _ = entity.update(cx, |this, _| {
-                            let ids: Vec<String> = if this.selected.contains(&drag.seed) {
-                                this.selected.iter().cloned().collect()
-                            } else {
-                                vec![drag.seed.clone()]
-                            };
-                            let paths = ids
-                                .iter()
-                                .filter_map(|id| {
-                                    this.photo_index
-                                        .get(id)
-                                        .and_then(|&i| this.library.photos.get(i))
-                                        .or_else(|| {
-                                            this.library.photos.iter().find(|p| &p.id == id)
-                                        })
-                                        .filter(|p| !p.path.as_os_str().is_empty())
-                                        .map(|p| p.path.clone())
-                                })
-                                .collect();
-                            *drag.ids.borrow_mut() = ids;
-                            *drag.paths.borrow_mut() = paths;
-                        });
-                        #[cfg(not(test))]
-                        if ui::native_transfer::start_file_drag(w, &drag.paths.borrow()) {
-                            w.defer(cx, |w, cx| {
-                                cx.stop_active_drag(w);
-                            });
+                        let external = entity
+                            .update(cx, |this, _| {
+                                this.prepare_photo_drag(drag);
+                                this.start_external_drag(drag, w.mouse_position(), w)
+                            })
+                            .unwrap_or(false);
+                        if external {
+                            Self::finish_external_handoff(w, cx);
                         }
-                        #[cfg(test)]
-                        let _ = (w, &drag.paths);
                         let mut preview = drag.clone();
                         preview.offset = offset; // keep compact preview beside the pointer, at every thumbnail size
                         cx.new(|_| preview)
@@ -2908,10 +3033,7 @@ impl PhotosApp {
                     .bg(rgb(c.surface))
                     .child(
                         kit::tool("close-viewer", "back", "Back to library · Esc", c).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.viewer = None;
-                                cx.notify();
-                            }),
+                            cx.listener(|this, _, w, cx| this.close_viewer(false, w, cx)),
                         ),
                     )
                     .child(div().flex_1().min_w_0().when(self.image_loading(), |d| {
@@ -3154,11 +3276,19 @@ impl PhotosApp {
                         let delta = e.delta.pixel_delta(px(28.));
                         if e.modifiers.platform || e.modifiers.control {
                             let at = e.position - this.viewer_bounds.center();
-                            this.viewport.set_zoom(
+                            this.set_viewer_zoom(
                                 this.viewport.zoom * (f32::from(delta.y) * 0.006).exp(),
                                 (at.x.into(), at.y.into()),
+                                true,
+                                w,
+                                cx,
                             );
-                            this.sync_zoom(w, cx);
+                        } else if !this.can_pan()
+                            && !e.modifiers.shift
+                            && !this.swipe_active
+                            && f32::from(delta.y).abs() > f32::from(delta.x).abs()
+                        {
+                            this.scroll_to_close(delta.y.into(), e.touch_phase, w, cx);
                         } else if !this.can_pan() {
                             let dx = if e.modifiers.shift && delta.x == px(0.) {
                                 delta.y
@@ -3220,6 +3350,34 @@ impl PhotosApp {
                             cx.notify();
                         }),
                     )
+                    .when(!self.can_pan(), |canvas| {
+                        let drag = DragPhotos {
+                            ids: Default::default(),
+                            seed: photo.id.clone(),
+                            photos: Default::default(),
+                            driver: self.driver.as_ref().unwrap().clone(),
+                            source: self.driver.as_ref().unwrap().source().path,
+                            paths: Default::default(),
+                            offset: point(px(0.), px(0.)),
+                            preview: self.thumbnails.peek(&photo.fingerprint).cloned(),
+                            colors: c,
+                        };
+                        let entity = cx.weak_entity();
+                        canvas.on_drag(drag, move |drag, offset, w, cx| {
+                            let external = entity
+                                .update(cx, |this, _| {
+                                    this.prepare_photo_drag(drag);
+                                    this.start_external_drag(drag, w.mouse_position(), w)
+                                })
+                                .unwrap_or(false);
+                            if external {
+                                Self::finish_external_handoff(w, cx);
+                            }
+                            let mut preview = drag.clone();
+                            preview.offset = offset;
+                            cx.new(|_| preview)
+                        })
+                    })
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(|this, e: &MouseDownEvent, _, cx| {
@@ -3953,6 +4111,7 @@ impl Render for PhotosApp {
         let width: f32 = w.viewport_size().width.into();
         let show_sidebar = self.sidebar && width >= 960.;
         let show_info = self.inspector && width >= 900.;
+        let guard_entity = cx.weak_entity();
         let mut root = div()
             .id("photos-app")
             .debug_selector(|| "photos-app".into())
@@ -3966,6 +4125,34 @@ impl Render for PhotosApp {
             .bg(rgb(c.raised))
             .text_color(rgb(c.text))
             .text_size(px(13.))
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, w, _| {
+                        let entity = guard_entity.clone();
+                        w.on_mouse_event(move |event: &ScrollWheelEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture {
+                                let blocked = entity
+                                    .update(cx, |this, _| {
+                                        this.block_dismissed_gesture(matches!(
+                                            event.touch_phase,
+                                            TouchPhase::Started
+                                        ))
+                                    })
+                                    .unwrap_or(false);
+                                if blocked {
+                                    cx.stop_propagation();
+                                }
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .on_drag_move::<DragPhotos>(
+                cx.listener(|this, event, w, cx| this.handoff_photo_drag(event, w, cx)),
+            )
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, w, cx| {
                 if event.keystroke.key == "escape" && this.menu.take().is_some() {
                     cx.stop_propagation();
@@ -4015,11 +4202,12 @@ impl Render for PhotosApp {
             }))
             .on_action(cx.listener(|this, _: &OpenSelected, w, cx| this.open_selected(w, cx)))
             .on_action(cx.listener(|this, _: &Back, w, cx| {
-                if this.menu.take().is_none()
-                    && this.modal.take().is_none()
-                    && this.viewer.take().is_none()
-                {
-                    this.selected.clear();
+                if this.menu.take().is_none() && this.modal.take().is_none() {
+                    if this.viewer.is_some() {
+                        this.close_viewer(false, w, cx);
+                    } else {
+                        this.selected.clear();
+                    }
                 }
                 this.focus.focus(w);
                 cx.notify();
