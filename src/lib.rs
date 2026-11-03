@@ -2,5 +2,6 @@
 pub mod drag_export;
 pub mod gallery;
 pub mod loading;
+pub mod native_image;
 pub mod sources;
 pub mod storage;

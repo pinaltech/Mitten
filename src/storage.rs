@@ -103,11 +103,22 @@ pub struct Photo {
     pub deleted: bool,
     pub caption: String,
     pub fingerprint: String,
+    /// Length of a video in seconds; `None` for still photos.
+    pub duration: Option<f32>,
 }
 #[derive(Clone, Debug, Default)]
 pub struct Library {
     pub photos: Vec<Arc<Photo>>,
     pub albums: BTreeMap<String, BTreeSet<String>>,
+    /// Albums mirrored from the provider. Their membership is read-only here.
+    pub synced: BTreeSet<String>,
+}
+/// Where a video can be played from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VideoSource {
+    File(PathBuf),
+    /// A PhotoKit local identifier.
+    PhotoKit(String),
 }
 #[derive(Clone, Debug, Default)]
 pub struct ImportReport {
@@ -148,6 +159,145 @@ pub trait PhotosDriver: Send + Sync {
     }
     fn refresh_library(&self, _library: Library) -> Result<Library> {
         self.scan()
+    }
+    /// An animated rendition (GIF) of a moving photo, sized for grid tiles
+    /// (`large == false`) or the viewer. `None` for still images.
+    fn motion(&self, _photo: &Photo, _large: bool) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
+    /// Where the viewer plays a video from; `None` for stills, or when this
+    /// source cannot stream videos.
+    fn video(&self, _photo: &Photo) -> Option<VideoSource> {
+        None
+    }
+    /// Centre-cropped `edge`² BGRA squares for painted grids, one result per
+    /// photo. Batched so sources can resolve many photos in one request.
+    fn squares(&self, photos: &[Arc<Photo>], edge: u32) -> Vec<Result<Vec<u8>>> {
+        squares_from_thumbnails(self, photos, edge)
+    }
+}
+
+/// Squares cropped from each photo's grid thumbnail, cached beside it.
+pub fn squares_from_thumbnails<D: PhotosDriver + ?Sized>(
+    driver: &D,
+    photos: &[Arc<Photo>],
+    edge: u32,
+) -> Vec<Result<Vec<u8>>> {
+    photos
+        .iter()
+        .map(|photo| {
+            let thumbnail = driver.thumbnail(photo)?;
+            let stem = thumbnail
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let cache = thumbnail.with_file_name(format!("{stem}-sq{edge}.jpg"));
+            crate::loading::cached_square(&cache, edge, || {
+                crate::loading::square_from_file(&thumbnail, edge)
+            })
+        })
+        .collect()
+}
+
+/// Whether a photo may be animated; only these formats are ever probed.
+pub fn may_move(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.ends_with(".gif") || name.ends_with(".webp")
+}
+pub(crate) const MOTION_SMALL: (u32, usize) = (360, 90);
+pub(crate) const MOTION_LARGE: (u32, usize) = (1600, 400);
+
+/// Writes `target` as a looping GIF of `original`'s animation, bounded to
+/// `edge` px and `max_frames` frames (longer clips keep their duration by
+/// dropping frames evenly). Returns false for still images. A GIF that already
+/// fits is copied byte for byte.
+pub(crate) fn write_motion(
+    original: &Path,
+    target: &Path,
+    (edge, max_frames): (u32, usize),
+) -> Result<bool> {
+    use image::{AnimationDecoder, Frame, codecs::gif};
+    let bytes = fs::read(original)?;
+    let format = image::guess_format(&bytes)?;
+    let frames = match format {
+        image::ImageFormat::Gif => gif::GifDecoder::new(std::io::Cursor::new(&bytes))?
+            .into_frames()
+            .take(4096)
+            .collect::<image::ImageResult<Vec<_>>>()?,
+        image::ImageFormat::WebP => {
+            let decoder = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(&bytes))?;
+            if !decoder.has_animation() {
+                return Ok(false);
+            }
+            decoder
+                .into_frames()
+                .take(4096)
+                .collect::<image::ImageResult<Vec<_>>>()?
+        }
+        _ => return Ok(false),
+    };
+    if frames.len() < 2 {
+        return Ok(false);
+    }
+    let (w, h) = frames[0].buffer().dimensions();
+    let parent = target.parent().context("motion cache has no directory")?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    if format == image::ImageFormat::Gif && w <= edge && h <= edge && frames.len() <= max_frames {
+        temp.write_all(&bytes)?;
+    } else {
+        let step = frames.len().div_ceil(max_frames);
+        let scale = (edge as f32 / w.max(h) as f32).min(1.);
+        let (tw, th) = (
+            ((w as f32 * scale).round() as u32).max(1),
+            ((h as f32 * scale).round() as u32).max(1),
+        );
+        let mut encoder = gif::GifEncoder::new_with_speed(temp.as_file_mut(), 10);
+        encoder.set_repeat(gif::Repeat::Infinite)?;
+        for chunk in frames.chunks(step) {
+            let (numer, denom) = chunk
+                .iter()
+                .map(|f| f.delay().numer_denom_ms())
+                .fold((0u32, 1u32), |(n, _), (fnum, fden)| {
+                    (n + fnum / fden.max(1), 1)
+                });
+            let buffer = image::imageops::thumbnail(chunk[0].buffer(), tw, th);
+            encoder.encode_frame(Frame::from_parts(
+                buffer,
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(numer.max(20), denom),
+            ))?;
+        }
+    }
+    // A cache file: atomic rename is enough; a full flush per file is slow.
+    match temp.persist_noclobber(target) {
+        Ok(_) => Ok(true),
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(true),
+        Err(e) => Err(e.error.into()),
+    }
+}
+/// Cached motion lookup shared by the drivers: `<cache>/<key>-motion<edge>.gif`,
+/// or a `-still` marker so stills are only probed once.
+pub(crate) fn cached_motion(
+    cache: &Path,
+    key: &str,
+    original: impl FnOnce() -> Result<PathBuf>,
+    large: bool,
+) -> Result<Option<PathBuf>> {
+    let spec = if large { MOTION_LARGE } else { MOTION_SMALL };
+    let target = cache.join(format!("{key}-motion{}.gif", spec.0));
+    let still = cache.join(format!("{key}-still"));
+    if target.is_file() {
+        return Ok(Some(target));
+    }
+    if still.is_file() {
+        return Ok(None);
+    }
+    if write_motion(&original()?, &target, spec)? {
+        Ok(Some(target))
+    } else {
+        fs::write(still, b"")?;
+        Ok(None)
     }
 }
 pub fn open_source(source: &Source) -> Result<Box<dyn PhotosDriver>> {
@@ -257,6 +407,22 @@ impl LocalPhotos {
             return Ok(target);
         }
         let path = self.original(&photo.id)?;
+        // ImageIO decodes at reduced scale (and reads HEIC); far faster than a
+        // full decode followed by a resize.
+        {
+            let temp = tempfile::NamedTempFile::new_in(target.parent().unwrap())?;
+            if crate::native_image::thumbnail(&path, temp.path(), edge) {
+                return match temp.persist_noclobber(&target) {
+                    Ok(_) => Ok(target),
+                    Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(target),
+                    Err(e) => Err(e.error.into()),
+                };
+            }
+        }
+        ensure!(
+            photo.duration.is_none(),
+            "Video previews are unavailable on this platform"
+        );
         let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
         let mut limits = image::Limits::default();
         limits.max_alloc = Some(512 * 1024 * 1024);
@@ -273,7 +439,8 @@ impl LocalPhotos {
         let mut temp = tempfile::NamedTempFile::new_in(target.parent().unwrap())?;
         image::codecs::jpeg::JpegEncoder::new_with_quality(temp.as_file_mut(), 88)
             .encode_image(&image)?;
-        temp.as_file().sync_all()?;
+        // Cache files are renamed into place atomically; flushing each one to
+        // disk (F_FULLFSYNC on macOS) would dominate thumbnail time.
         // Multiple visible views may request the same thumbnail concurrently.
         match temp.persist_noclobber(&target) {
             Ok(_) => Ok(target),
@@ -301,7 +468,13 @@ impl PhotosDriver for LocalPhotos {
                 .strip_prefix(&self.root)?
                 .to_string_lossy()
                 .replace('\\', "/");
-            let (width, height) = image::image_dimensions(&path).unwrap_or((0, 0));
+            let (width, height, duration) = if is_video(&path) {
+                crate::native_image::video_info(&path)
+                    .map_or((0, 0, Some(0.)), |(w, h, d)| (w, h, Some(d)))
+            } else {
+                let (w, h) = image::image_dimensions(&path).unwrap_or((0, 0));
+                (w, h, None)
+            };
             let fingerprint = format!(
                 "{:x}",
                 Sha256::digest(
@@ -329,12 +502,14 @@ impl PhotosDriver for LocalPhotos {
                 caption: meta.captions.get(&id).cloned().unwrap_or_default(),
                 fingerprint,
                 id,
+                duration,
             }));
         }
         photos.sort_by(|a, b| b.modified.cmp(&a.modified).then(a.id.cmp(&b.id)));
         Ok(Library {
             photos,
             albums: meta.albums,
+            synced: BTreeSet::new(),
         })
     }
     fn thumbnail(&self, photo: &Photo) -> Result<PathBuf> {
@@ -342,6 +517,44 @@ impl PhotosDriver for LocalPhotos {
     }
     fn preview(&self, photo: &Photo) -> Result<PathBuf> {
         self.decode(photo, 2560, "preview")
+    }
+    fn squares(&self, photos: &[Arc<Photo>], edge: u32) -> Vec<Result<Vec<u8>>> {
+        photos
+            .iter()
+            .map(|photo| {
+                let cache = self.safe(&format!(
+                    ".desert-photos/cache/{}",
+                    crate::loading::Square::file_name_for(&photo.fingerprint, edge)
+                ))?;
+                crate::loading::cached_square(&cache, edge, || {
+                    // Embedded previews make this nearly free for camera files.
+                    let original = self.original(&photo.id)?;
+                    if let Some(pixels) = crate::native_image::square(&original, edge) {
+                        return Ok(pixels);
+                    }
+                    let thumbnail = self.thumbnail(photo)?;
+                    crate::loading::square_from_file(&thumbnail, edge)
+                })
+            })
+            .collect()
+    }
+    fn motion(&self, photo: &Photo, large: bool) -> Result<Option<PathBuf>> {
+        if !may_move(&photo.name) {
+            return Ok(None);
+        }
+        let cache = self.safe(".desert-photos/cache/probe")?;
+        cached_motion(
+            cache.parent().unwrap(),
+            &photo.fingerprint,
+            || self.original(&photo.id),
+            large,
+        )
+    }
+    fn video(&self, photo: &Photo) -> Option<VideoSource> {
+        photo
+            .duration
+            .and_then(|_| self.original(&photo.id).ok())
+            .map(VideoSource::File)
     }
     fn import(&self, paths: &[PathBuf]) -> Result<ImportReport> {
         let _lock = self.write_lock()?;
@@ -481,11 +694,21 @@ impl PhotosDriver for LocalPhotos {
     }
 }
 pub fn supported(path: &Path) -> bool {
-    path.extension().is_some_and(|e| {
-        ["jpg", "jpeg", "png", "gif", "webp", "tif", "tiff", "bmp"]
-            .iter()
-            .any(|s| e.eq_ignore_ascii_case(s))
-    })
+    is_video(path)
+        || path.extension().is_some_and(|e| {
+            ["jpg", "jpeg", "png", "gif", "webp", "tif", "tiff", "bmp"]
+                .iter()
+                .any(|s| e.eq_ignore_ascii_case(s))
+        })
+}
+/// Videos are catalogued only where the platform can make their previews.
+pub fn is_video(path: &Path) -> bool {
+    crate::native_image::VIDEO
+        && path.extension().is_some_and(|e| {
+            ["mov", "mp4", "m4v"]
+                .iter()
+                .any(|s| e.eq_ignore_ascii_case(s))
+        })
 }
 pub fn album_name(name: &str) -> Result<String> {
     let name = name.trim();

@@ -1,6 +1,8 @@
 use super::*;
 use crate::loading::PAGE_SIZE;
+use crate::storage::VideoSource;
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, c_char};
 use std::sync::Arc;
 
@@ -9,6 +11,14 @@ unsafe extern "C" {
     fn dp_photos_page(offset: usize, limit: usize) -> *mut c_char;
     fn dp_photos_image(id: *const c_char, destination: *const c_char, edge: u32) -> *mut c_char;
     fn dp_photos_original(id: *const c_char, destination: *const c_char) -> *mut c_char;
+    fn dp_photos_squares(
+        ids: *const *const c_char,
+        count: usize,
+        edge: u32,
+        pixels: *mut u8,
+        ok: *mut u8,
+    ) -> *mut c_char;
+    fn dp_photos_albums() -> *mut c_char;
     fn dp_photos_free(value: *mut c_char);
 }
 pub struct ApplePhotos;
@@ -58,13 +68,14 @@ impl Provider for ApplePhotos {
                     favorite: a["favorite"].as_bool().unwrap_or(false),
                     deleted: false,
                     caption: String::new(),
+                    duration: a["duration"].as_f64().map(|d| d as f32),
                 }))
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(PhotoPage {
             library: Library {
                 photos,
-                albums: Default::default(),
+                ..Default::default()
             },
             next: (end < total).then(|| end.to_string()),
             total: Some(total),
@@ -81,6 +92,85 @@ impl Provider for ApplePhotos {
             ))
         }?;
         Ok(())
+    }
+    /// Photos keeps small thumbnails for every asset; reading those (fast
+    /// format, no download) is far quicker than rendering 512 px previews.
+    fn squares(&self, photos: &[Arc<Photo>], edge: u32) -> Option<Vec<Result<Vec<u8>>>> {
+        let ids: Vec<CString> = photos
+            .iter()
+            .map(|p| CString::new(p.id.as_str()).unwrap_or_default())
+            .collect();
+        let pointers: Vec<*const c_char> = ids.iter().map(|id| id.as_ptr()).collect();
+        let size = (edge * edge * 4) as usize;
+        let mut pixels = vec![0u8; size * photos.len()];
+        let mut ok = vec![0u8; photos.len()];
+        let status = unsafe {
+            result(dp_photos_squares(
+                pointers.as_ptr(),
+                photos.len(),
+                edge,
+                pixels.as_mut_ptr(),
+                ok.as_mut_ptr(),
+            ))
+        };
+        if let Err(e) = status {
+            let message = e.to_string();
+            return Some(
+                photos
+                    .iter()
+                    .map(|_| Err(anyhow::anyhow!("{message}")))
+                    .collect(),
+            );
+        }
+        Some(
+            pixels
+                .chunks_exact(size)
+                .zip(ok)
+                .map(|(square, ok)| {
+                    if ok == 1 {
+                        Ok(square.to_vec())
+                    } else {
+                        Err(anyhow::anyhow!("Photos has no cached thumbnail"))
+                    }
+                })
+                .collect(),
+        )
+    }
+    /// Albums keep their Apple Photos names; a repeated name gets a number.
+    fn albums(&self) -> Result<BTreeMap<String, BTreeSet<String>>> {
+        let data = unsafe { result(dp_photos_albums()) }?;
+        let mut albums = BTreeMap::new();
+        for album in data["albums"]
+            .as_array()
+            .context("Invalid PhotoKit albums")?
+        {
+            let base = album["name"].as_str().unwrap_or("Untitled Album").trim();
+            let base = if base.is_empty() {
+                "Untitled Album"
+            } else {
+                base
+            };
+            let mut name = base.to_owned();
+            for n in 2.. {
+                if !albums.contains_key(&name) {
+                    break;
+                }
+                name = format!("{base} ({n})");
+            }
+            let ids = album["ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|id| id.as_str().map(str::to_owned))
+                .collect();
+            albums.insert(name, ids);
+        }
+        Ok(albums)
+    }
+    fn video(&self, photo: &Photo) -> Option<VideoSource> {
+        photo
+            .duration
+            .map(|_| VideoSource::PhotoKit(photo.id.clone()))
     }
     fn original(&self, id: &str, destination: &Path) -> Result<String> {
         let id = CString::new(id)?;

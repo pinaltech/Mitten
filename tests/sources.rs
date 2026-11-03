@@ -36,6 +36,7 @@ impl Provider for MillionPhotos {
                     deleted: false,
                     caption: String::new(),
                     fingerprint: format!("asset-{i}-v1"),
+                    duration: None,
                 })
             })
             .collect();
@@ -43,6 +44,7 @@ impl Provider for MillionPhotos {
             library: Library {
                 photos,
                 albums: Default::default(),
+                synced: Default::default(),
             },
             next: (end < 1_000_000).then(|| end.to_string()),
             total: Some(1_000_000),
@@ -519,6 +521,7 @@ mod remote {
                 deleted: false,
                 caption: String::new(),
                 fingerprint: String::new(),
+                duration: None,
             };
             let dir = tempfile::tempdir().unwrap();
             assert!(
@@ -573,4 +576,86 @@ fn promised_connected_originals_are_fetched_only_on_fulfillment() {
         "an occupied destination must fail before downloading another original"
     );
     assert_eq!(fs::read_dir(receiver.path()).unwrap().count(), 1);
+}
+
+/// A provider with its own albums, as Apple Photos has.
+struct AlbumSource;
+impl Provider for AlbumSource {
+    fn page(&self, _: Option<&str>) -> Result<PhotoPage> {
+        let photos = (0..3)
+            .map(|i| {
+                Arc::new(Photo {
+                    id: format!("{i}"),
+                    name: if i == 2 {
+                        "Clip.mov".into()
+                    } else {
+                        format!("Photo {i}.png")
+                    },
+                    path: Default::default(),
+                    modified: Default::default(),
+                    bytes: 10,
+                    width: 64,
+                    height: 48,
+                    favorite: false,
+                    deleted: false,
+                    caption: String::new(),
+                    fingerprint: format!("asset-{i}"),
+                    duration: (i == 2).then_some(12.5),
+                })
+            })
+            .collect();
+        Ok(PhotoPage {
+            library: Library {
+                photos,
+                ..Default::default()
+            },
+            next: None,
+            total: Some(3),
+        })
+    }
+    fn image(&self, _: &Photo, _: bool, _: &Path) -> Result<()> {
+        anyhow::bail!("unused")
+    }
+    fn original(&self, _: &str, _: &Path) -> Result<String> {
+        anyhow::bail!("unused")
+    }
+    fn albums(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>> {
+        Ok([
+            ("Trip".to_owned(), ["0".to_owned(), "2".to_owned()].into()),
+            ("Shared".to_owned(), ["1".to_owned()].into()),
+        ]
+        .into())
+    }
+}
+#[test]
+fn provider_albums_sync_read_only_and_merge_with_local_albums() {
+    let dir = tempfile::tempdir().unwrap();
+    let driver = ConnectedPhotos::new(
+        Source {
+            driver: "synthetic".into(),
+            path: dir.path().join("source"),
+        },
+        Box::new(AlbumSource),
+    )
+    .unwrap();
+    driver.create_album("Shared").unwrap();
+    driver.add_to_album("Shared", &["0".into()]).unwrap();
+    let library = driver.page(None).unwrap().library;
+    assert_eq!(library.albums["Trip"].len(), 2);
+    assert!(library.synced.contains("Trip"));
+    // A local album of the same name merges, and stays editable here.
+    assert_eq!(library.albums["Shared"].len(), 2);
+    assert!(!library.synced.contains("Shared"));
+    assert!(driver.add_to_album("Trip", &["1".into()]).is_err());
+    assert!(driver.remove_from_album("Trip", &["0".into()]).is_err());
+    assert!(driver.remove_from_album("Shared", &["1".into()]).is_err());
+    driver.remove_from_album("Shared", &["0".into()]).unwrap();
+    // Annotation refreshes (after favoriting, say) keep the synced albums.
+    driver.favorite(&["0".into()], true).unwrap();
+    let refreshed = driver.refresh_library(library).unwrap();
+    assert!(refreshed.synced.contains("Trip"));
+    assert_eq!(refreshed.albums["Shared"].len(), 1);
+    assert_eq!(refreshed.photos[2].duration, Some(12.5));
 }

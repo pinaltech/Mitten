@@ -47,17 +47,23 @@ char *dp_photos_page(size_t offset, size_t limit) {
             if (offset == 0 || snapshot == nil) {
                 PHFetchOptions *options = [PHFetchOptions new];
                 options.sortDescriptors = @[[NSSortDescriptor sortDescriptorWithKey:@"creationDate" ascending:NO]];
-                snapshot = [PHAsset fetchAssetsWithMediaType:PHAssetMediaTypeImage options:options];
+                options.predicate = [NSPredicate predicateWithFormat:@"mediaType == %d || mediaType == %d",
+                    (int)PHAssetMediaTypeImage, (int)PHAssetMediaTypeVideo];
+                snapshot = [PHAsset fetchAssetsWithOptions:options];
             }
             NSMutableArray *items = [NSMutableArray new];
             NSUInteger end = MIN(snapshot.count, offset + limit);
             for (NSUInteger i = offset; i < end; ++i) {
                 PHAsset *asset = [snapshot objectAtIndex:i];
                 PHAssetResource *resource = [PHAssetResource assetResourcesForAsset:asset].firstObject;
-                [items addObject:@{@"id": asset.localIdentifier, @"name": resource.originalFilename ?: @"Photo",
+                BOOL video = asset.mediaType == PHAssetMediaTypeVideo;
+                NSMutableDictionary *item = [@{@"id": asset.localIdentifier,
+                    @"name": resource.originalFilename ?: (video ? @"Video" : @"Photo"),
                     @"modified": @((asset.modificationDate ?: asset.creationDate).timeIntervalSince1970),
                     @"created": @(asset.creationDate.timeIntervalSince1970),
-                    @"width": @(asset.pixelWidth), @"height": @(asset.pixelHeight), @"favorite": @(asset.favorite)}];
+                    @"width": @(asset.pixelWidth), @"height": @(asset.pixelHeight), @"favorite": @(asset.favorite)} mutableCopy];
+                if (video) item[@"duration"] = @(asset.duration);
+                [items addObject:item];
             }
             return reply(@{@"items": items, @"total": @(snapshot.count), @"end": @(end)});
         }
@@ -73,14 +79,18 @@ char *dp_photos_image(const char *identifier, const char *destination, unsigned 
         if (!asset) return failure(@"This photo is no longer available.");
         PHImageRequestOptions *options = [PHImageRequestOptions new];
         options.synchronous = YES;
-        options.networkAccessAllowed = YES;
         options.deliveryMode = PHImageRequestOptionsDeliveryModeHighQualityFormat;
-        options.resizeMode = PHImageRequestOptionsResizeModeExact;
+        // Grid thumbnails need no exact scaling; previews keep it.
+        options.resizeMode = edge <= 512 ? PHImageRequestOptionsResizeModeFast : PHImageRequestOptionsResizeModeExact;
         __block NSImage *result = nil;
-        [[PHImageManager defaultManager] requestImageForAsset:asset targetSize:CGSizeMake(edge, edge)
-            contentMode:PHImageContentModeAspectFit options:options resultHandler:^(NSImage *image, NSDictionary *info) {
-                if (![info[PHImageResultIsDegradedKey] boolValue]) result = image;
-            }];
+        // Local derivatives first; only then fall back to downloading from iCloud.
+        for (int network = 0; network < 2 && !result; ++network) {
+            options.networkAccessAllowed = network == 1;
+            [[PHImageManager defaultManager] requestImageForAsset:asset targetSize:CGSizeMake(edge, edge)
+                contentMode:PHImageContentModeAspectFit options:options resultHandler:^(NSImage *image, NSDictionary *info) {
+                    if (![info[PHImageResultIsDegradedKey] boolValue]) result = image;
+                }];
+        }
         if (!result) return failure(@"PhotoKit could not load this preview. Check iCloud connectivity.");
         CGImageRef cg = [result CGImageForProposedRect:NULL context:nil hints:nil];
         if (!cg) return failure(@"PhotoKit returned an unsupported image.");
@@ -100,8 +110,9 @@ char *dp_photos_original(const char *identifier, const char *destination) {
         if (!asset) return failure(@"This photo is no longer available.");
         NSArray<PHAssetResource *> *resources = [PHAssetResource assetResourcesForAsset:asset];
         PHAssetResource *resource = nil;
-        for (PHAssetResource *r in resources) if (r.type == PHAssetResourceTypePhoto) { resource = r; break; }
-        if (!resource) return failure(@"The original image resource is unavailable.");
+        PHAssetResourceType wanted = asset.mediaType == PHAssetMediaTypeVideo ? PHAssetResourceTypeVideo : PHAssetResourceTypePhoto;
+        for (PHAssetResource *r in resources) if (r.type == wanted) { resource = r; break; }
+        if (!resource) return failure(@"The original resource is unavailable.");
         PHAssetResourceRequestOptions *options = [PHAssetResourceRequestOptions new];
         options.networkAccessAllowed = YES;
         dispatch_semaphore_t done = dispatch_semaphore_create(0);
@@ -117,6 +128,72 @@ char *dp_photos_original(const char *identifier, const char *destination) {
         [file closeFile];
         if (problem) return failure(problem.localizedDescription);
         return reply(@{@"name": resource.originalFilename});
+    }
+}
+int dp_fill_square(CGImageRef image, unsigned edge, uint8_t *pixels);
+// Small centre-cropped squares for dense grids, `count` at a time, straight from
+// the thumbnails Photos already keeps (fast format, no iCloud download). One
+// fetch resolves the whole batch. Fills `pixels` (count × edge² × 4, BGRA) and
+// sets ok[i] for each square produced.
+char *dp_photos_squares(const char **identifiers, size_t count, unsigned edge, uint8_t *pixels, uint8_t *ok) {
+    @autoreleasepool {
+        NSString *configurationError = usage_error();
+        if (configurationError) return failure(configurationError);
+        if (!authorized()) return failure(@"Photos permission is unavailable. Reconnect Apple Photos.");
+        NSMutableArray<NSString *> *keys = [NSMutableArray arrayWithCapacity:count];
+        for (size_t i = 0; i < count; ++i) [keys addObject:[NSString stringWithUTF8String:identifiers[i]]];
+        NSMutableDictionary<NSString *, PHAsset *> *assets = [NSMutableDictionary dictionaryWithCapacity:count];
+        [[PHAsset fetchAssetsWithLocalIdentifiers:keys options:nil] enumerateObjectsUsingBlock:^(PHAsset *asset, NSUInteger i, BOOL *stop) {
+            (void)i; (void)stop;
+            assets[asset.localIdentifier] = asset;
+        }];
+        PHImageRequestOptions *options = [PHImageRequestOptions new];
+        options.synchronous = YES;
+        options.deliveryMode = PHImageRequestOptionsDeliveryModeFastFormat;
+        options.resizeMode = PHImageRequestOptionsResizeModeFast;
+        options.networkAccessAllowed = NO;
+        CGSize target = CGSizeMake(edge * 2, edge * 2);
+        for (size_t i = 0; i < count; ++i) {
+            ok[i] = 0;
+            PHAsset *asset = assets[keys[i]];
+            if (!asset) continue;
+            __block NSImage *result = nil;
+            [[PHImageManager defaultManager] requestImageForAsset:asset targetSize:target
+                contentMode:PHImageContentModeAspectFill options:options resultHandler:^(NSImage *image, NSDictionary *info) {
+                    (void)info;
+                    if (image) result = image;
+                }];
+            if (!result) continue;
+            CGImageRef cg = [result CGImageForProposedRect:NULL context:nil hints:nil];
+            ok[i] = (uint8_t)dp_fill_square(cg, edge, pixels + i * (size_t)edge * edge * 4);
+        }
+        return reply(@{@"ok": @YES});
+    }
+}
+// Every user album (including those inside folders) with its member asset
+// identifiers. Smart albums are left out: favorites and videos have their own
+// views, and the rest are derived from metadata Photos already has.
+char *dp_photos_albums(void) {
+    @autoreleasepool {
+        NSString *configurationError = usage_error();
+        if (configurationError) return failure(configurationError);
+        if (!authorized()) return failure(@"Photos permission is unavailable. Reconnect Apple Photos.");
+        NSMutableArray *albums = [NSMutableArray new];
+        PHFetchResult<PHAssetCollection *> *collections =
+            [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeAlbum
+                subtype:PHAssetCollectionSubtypeAlbumRegular options:nil];
+        PHFetchOptions *members = [PHFetchOptions new];
+        members.predicate = [NSPredicate predicateWithFormat:@"mediaType == %d || mediaType == %d",
+            (int)PHAssetMediaTypeImage, (int)PHAssetMediaTypeVideo];
+        for (PHAssetCollection *collection in collections) {
+            @autoreleasepool {
+                NSMutableArray *ids = [NSMutableArray new];
+                for (PHAsset *asset in [PHAsset fetchAssetsInAssetCollection:collection options:members])
+                    [ids addObject:asset.localIdentifier];
+                [albums addObject:@{@"name": collection.localizedTitle ?: @"Untitled Album", @"ids": ids}];
+            }
+        }
+        return reply(@{@"albums": albums});
     }
 }
 void dp_photos_free(char *value) { free(value); }

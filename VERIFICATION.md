@@ -1,5 +1,34 @@
 # Verification
 
+## Gallery zoom reflow and cursor — November 1, 2026
+
+- Zoom transitions no longer draw a layout below its natural size, so the grid
+  always fills the width (no empty side strips, no edge fade-ins). Layouts
+  switch near the next size; short moves glide, far wraps crossfade. Each
+  layout scales about the zoomed photo, which holds still between reflows and
+  ends in the pointer's row. Tiles use the arrow cursor at every level.
+- Covered by the gallery switching/detent test and a GPUI test zooming in and
+  out across gutter, gapless and month levels (the spot under the pointer stays
+  put, every layer is drawn at ≥ natural size and spans the width, the photo
+  ends in the pointer's row). Visual smoothness on a trackpad still needs a
+  person at the machine.
+
+## Viewer transitions, videos, album sync and library switcher — November 1, 2026
+
+- **61 tests pass** (four new: Apple-style album sync, zoom anchoring, tile
+  open/close flights, Videos tab and switcher). Formatting and strict
+  all-target Clippy pass. Portable core, remote-only and PhotoKit-free native
+  UI feature sets check. The macOS debug bundle builds, links AVKit,
+  AVFoundation and CoreMedia, and launched cleanly with an empty isolated profile.
+- A generated 3-second 640×360 MP4 in a local folder catalogued with its size
+  and duration, produced a 512 px frame thumbnail and a grid square, and
+  resolved to a playable file. Native playback, Apple Photos videos and album
+  sync against a real Photos library, and trackpad feel were **not** exercised
+  here: they need a person at the machine.
+- Swipe performance changes (neighbour preview prefetch/decode, one idle
+  watcher per gesture, clock-timed slides, two previews in flight) are covered
+  for state, not measured as frame times on a device.
+
 ## Original drag export and minimum viewer zoom — October 31, 2026
 
 - **46 tests pass:** six geometry/cache tests, fourteen GPUI interaction tests,

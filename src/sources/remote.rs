@@ -118,6 +118,7 @@ impl Remote {
             let modified = date(a["fileCreatedAt"].as_str().or(a["createdAt"].as_str()));
             photos.push(Arc::new(Photo {
                 fingerprint: digest(&format!("{id}:{}:{}", a["updatedAt"], a["checksum"])),
+                duration: None,
                 id,
                 path: PathBuf::new(),
                 name: a["originalFileName"].as_str().unwrap_or("Photo").into(),
@@ -157,6 +158,7 @@ impl Remote {
             library: Library {
                 photos,
                 albums: Default::default(),
+                synced: Default::default(),
             },
             next,
             total,
@@ -469,12 +471,14 @@ pub fn parse_nextcloud(bytes: &[u8], scope: &Url, offset: usize) -> Result<Photo
             favorite: prop("http://owncloud.org/ns", "favorite") == Some("1"),
             deleted: false,
             caption: String::new(),
+            duration: None,
         }));
     }
     Ok(PhotoPage {
         library: Library {
             photos,
             albums: Default::default(),
+            synced: Default::default(),
         },
         next,
         total: None,

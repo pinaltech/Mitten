@@ -1,2 +1,21 @@
+# Rust build output (also holds the bundled .app)
 /target/
+**/*.rs.bk
+*.pdb
+
+# macOS
 .DS_Store
+._*
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local environment and secrets
+.env
+.env.*
+
+# Local app profiles / test data
+.desert-photos/

@@ -237,3 +237,93 @@ fn concurrent_album_updates_are_serialized() {
     }
     assert_eq!(driver.scan().unwrap().albums.len(), 12);
 }
+
+#[test]
+fn moving_photos_get_looping_renditions_and_stills_are_probed_once() {
+    use image::{Delay, Frame, RgbaImage, codecs::gif::GifEncoder};
+    let dir = tempfile::tempdir().unwrap();
+    let mut file = fs::File::create(dir.path().join("wave.gif")).unwrap();
+    {
+        let mut encoder = GifEncoder::new(&mut file);
+        for shade in [10u8, 120, 240] {
+            encoder
+                .encode_frame(Frame::from_parts(
+                    RgbaImage::from_pixel(800, 400, image::Rgba([shade, 40, 90, 255])),
+                    0,
+                    0,
+                    Delay::from_numer_denom_ms(80, 1),
+                ))
+                .unwrap();
+        }
+    }
+    drop(file);
+    image(&dir.path().join("still.gif"), 30);
+    let library = LocalPhotos::open(dir.path()).unwrap();
+    let scanned = library.scan().unwrap();
+    let find = |name: &str| {
+        scanned
+            .photos
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap()
+            .clone()
+    };
+    let wave = find("wave.gif");
+    let small = library
+        .motion(&wave, false)
+        .unwrap()
+        .expect("animated GIF has motion");
+    let large = library.motion(&wave, true).unwrap().unwrap();
+    for (path, edge) in [(&small, 360), (&large, 800)] {
+        use image::AnimationDecoder;
+        let decoder = image::codecs::gif::GifDecoder::new(std::io::BufReader::new(
+            fs::File::open(path).unwrap(),
+        ))
+        .unwrap();
+        let frames = decoder.into_frames().collect_frames().unwrap();
+        assert_eq!(frames.len(), 3, "every frame survives");
+        assert_eq!(frames[0].buffer().width(), edge);
+    }
+    assert_eq!(
+        fs::read(&large).unwrap(),
+        fs::read(dir.path().join("wave.gif")).unwrap(),
+        "a GIF that already fits the viewer is used byte for byte"
+    );
+    let still = find("still.gif");
+    assert!(library.motion(&still, false).unwrap().is_none());
+    assert!(library.motion(&still, true).unwrap().is_none());
+    assert!(
+        storage::may_move("A.GIF") && storage::may_move("b.webp") && !storage::may_move("c.jpg")
+    );
+}
+
+#[test]
+fn dense_grid_squares_come_from_originals_once_and_then_from_the_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut wide = image::RgbImage::from_pixel(900, 300, image::Rgb([0, 0, 250]));
+    for y in 0..300 {
+        for x in 0..250 {
+            wide.put_pixel(x, y, image::Rgb([250, 0, 0]));
+        }
+    }
+    wide.save(dir.path().join("wide.jpg")).unwrap();
+    let library = LocalPhotos::open(dir.path()).unwrap();
+    let photos = library.scan().unwrap().photos;
+    for edge in [64, 160] {
+        let squares = library.squares(&photos, edge);
+        let pixels = squares[0].as_ref().unwrap();
+        assert_eq!(pixels.len(), (edge * edge * 4) as usize);
+        // Centre-cropped: the red strip on the left is gone (BGRA: blue first).
+        let centre = ((edge / 2 * edge + edge / 2) * 4) as usize;
+        assert!(pixels[centre] > 200 && pixels[centre + 2] < 60);
+        assert!(pixels[0] > 150, "left edge is from the blue centre");
+        let cache = dir.path().join(format!(
+            ".desert-photos/cache/{}-sq{edge}.jpg",
+            photos[0].fingerprint
+        ));
+        assert!(cache.is_file(), "squares are cached for later sessions");
+    }
+    // The cache answers even once the original is gone.
+    fs::remove_file(dir.path().join("wide.jpg")).unwrap();
+    assert!(library.squares(&photos, 64)[0].is_ok());
+}

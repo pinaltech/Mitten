@@ -2,6 +2,8 @@ use std::{env, path::PathBuf, process::Command};
 fn main() {
     println!("cargo:rerun-if-changed=native/photokit.m");
     println!("cargo:rerun-if-changed=native/drag_export.m");
+    println!("cargo:rerun-if-changed=native/imageio.m");
+    println!("cargo:rerun-if-changed=native/video.m");
     println!("cargo:rerun-if-changed=native/Info.plist");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos")
         || (env::var_os("CARGO_FEATURE_APPLE_PHOTOS").is_none()
@@ -33,8 +35,10 @@ fn main() {
     for (feature, name) in [
         ("CARGO_FEATURE_APPLE_PHOTOS", "photokit"),
         ("CARGO_FEATURE_NATIVE_UI", "drag_export"),
+        ("CARGO_FEATURE_NATIVE_UI", "video"),
+        ("", "imageio"),
     ] {
-        if env::var_os(feature).is_none() {
+        if !feature.is_empty() && env::var_os(feature).is_none() {
             continue;
         }
         let object = out.join(format!("{name}.o"));
@@ -76,7 +80,17 @@ fn main() {
     );
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=photos_native");
-    for framework in ["Photos", "Foundation", "AppKit", "UniformTypeIdentifiers"] {
+    for framework in [
+        "Photos",
+        "Foundation",
+        "AppKit",
+        "UniformTypeIdentifiers",
+        "ImageIO",
+        "CoreGraphics",
+        "AVFoundation",
+        "AVKit",
+        "CoreMedia",
+    ] {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
 }
