@@ -610,11 +610,11 @@ fn scroll_pages_retry_and_request_limits_are_enforced(cx: &mut TestAppContext) {
     entity.update_in(cx, |app, _, cx| {
         app.pending.clear();
         for photo in synthetic_photos(100_000..100_100) {
-            app.request_image(photo.as_ref().clone(), false, cx);
+            app.request_image(&photo, false, cx);
         }
         assert_eq!(app.pending.len(), THUMBNAIL_JOBS);
         for photo in synthetic_photos(100_000..100_100) {
-            app.request_image(photo.as_ref().clone(), true, cx);
+            app.request_image(&photo, true, cx);
         }
         // The photo on screen never waits behind a neighbour's prefetch.
         assert_eq!(app.pending.len(), THUMBNAIL_JOBS + 2);
@@ -2096,4 +2096,24 @@ fn videos_tab_badges_and_library_switcher(cx: &mut TestAppContext) {
         assert!(!app.library_menu);
         assert!(app.modal == Some(Modal::Sources) && app.settings_page == 0);
     });
+}
+
+#[test]
+fn search_matching_folds_case_like_to_lowercase() {
+    for (haystack, needle) in [
+        ("IMG_0042.HEIC", "img_00"),
+        ("Beach Day", "day"),
+        ("Beach Day", "night"),
+        ("", "a"),
+        ("ab", "abc"),
+        ("Ünïcode Straße", "straße"),
+        ("ÉTÉ", "été"),
+        ("anything", ""),
+    ] {
+        assert_eq!(
+            super::contains_folded(haystack, needle),
+            haystack.to_lowercase().contains(needle),
+            "{haystack:?} / {needle:?}"
+        );
+    }
 }

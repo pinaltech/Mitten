@@ -158,24 +158,26 @@ impl PhotosApp {
         .detach();
         cx.notify();
     }
-    fn place_photo(&self, place: &storage::Place) -> Photo {
+    fn place_photo(&self, place: &storage::Place) -> Arc<Photo> {
         self.photo_index
             .get(&place.photo)
             .and_then(|&i| self.library.photos.get(i))
-            .map(|p| p.as_ref().clone())
-            .unwrap_or_else(|| Photo {
-                id: place.photo.clone(),
-                path: PathBuf::new(),
-                name: place.name.clone(),
-                modified: Default::default(),
-                bytes: 0,
-                width: 0,
-                height: 0,
-                favorite: false,
-                deleted: false,
-                caption: String::new(),
-                fingerprint: format!("place-{}", place.photo),
-                duration: None,
+            .cloned()
+            .unwrap_or_else(|| {
+                Arc::new(Photo {
+                    id: place.photo.clone(),
+                    path: PathBuf::new(),
+                    name: place.name.clone(),
+                    modified: Default::default(),
+                    bytes: 0,
+                    width: 0,
+                    height: 0,
+                    favorite: false,
+                    deleted: false,
+                    caption: String::new(),
+                    fingerprint: format!("place-{}", place.photo),
+                    duration: None,
+                })
             })
     }
     pub(super) fn explore_view(&mut self, c: Colors, cx: &mut Context<Self>) -> AnyElement {
@@ -285,7 +287,7 @@ impl PhotosApp {
                 let photo = self.place_photo(place);
                 let thumbnail = self.thumbnails.get(&photo.fingerprint).cloned();
                 if thumbnail.is_none() {
-                    self.request_image(photo.clone(), false, cx);
+                    self.request_image(&photo, false, cx);
                 }
                 let name = place.name.clone();
                 places = places.child(
@@ -414,7 +416,7 @@ impl PhotosApp {
                 )
             })
     }
-    /// "Oct 25th '24 – Nov 15th '24" for the photos on screen.
+    /// "Oct 25th, 2024 – Nov 15th, 2024" for the photos on screen.
     fn visible_dates(&self, cx: &App) -> Option<String> {
         let photos = self.visible(cx);
         if photos.is_empty() {
@@ -459,7 +461,7 @@ impl PhotosApp {
                 (3, _) => "rd",
                 _ => "th",
             };
-            format!("{} {n}{suffix} '{}", d.format("%b"), d.format("%y"))
+            format!("{} {n}{suffix}, {}", d.format("%b"), d.year())
         };
         let (a, b) = (day(first), day(last));
         Some(if a == b { a } else { format!("{a} – {b}") })

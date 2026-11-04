@@ -1510,9 +1510,9 @@ impl PhotosApp {
             })
             .filter(|(_, p)| {
                 query.is_empty()
-                    || p.name.to_lowercase().contains(&query)
-                    || p.caption.to_lowercase().contains(&query)
-                    || p.id.to_lowercase().contains(&query)
+                    || contains_folded(&p.name, &query)
+                    || contains_folded(&p.caption, &query)
+                    || contains_folded(&p.id, &query)
                     || remote.is_some_and(|ids| ids.contains(&p.id))
             })
             .map(|(i, _)| i)
@@ -1549,7 +1549,7 @@ impl PhotosApp {
         self.focus.focus(w);
         cx.notify();
     }
-    fn current(&self) -> Option<Photo> {
+    fn current(&self) -> Option<Arc<Photo>> {
         self.viewer
             .as_ref()
             .or_else(|| self.selected.iter().next())
@@ -1559,7 +1559,7 @@ impl PhotosApp {
                     .and_then(|&i| self.library.photos.get(i))
                     .or_else(|| self.library.photos.iter().find(|p| p.id == *id))
             })
-            .map(|p| p.as_ref().clone())
+            .cloned()
     }
     fn select(
         &mut self,
@@ -1608,7 +1608,7 @@ impl PhotosApp {
             self.viewport.reset();
             self.pan_start = None;
             self.sync_zoom(w, cx);
-            self.request_image(photo.as_ref().clone(), true, cx);
+            self.request_image(&photo, true, cx);
         }
         self.focus.focus(w);
         cx.notify();
@@ -1627,7 +1627,7 @@ impl PhotosApp {
             self.viewport.reset();
             self.pan_start = None;
             self.sync_zoom(w, cx);
-            self.request_image(photo, true, cx);
+            self.request_image(&photo, true, cx);
             cx.notify();
         }
     }
@@ -2081,20 +2081,15 @@ impl PhotosApp {
         }
         cx.notify();
     }
-    fn request_image(&mut self, photo: Photo, preview: bool, cx: &mut Context<Self>) {
-        let key = format!(
-            "{}-{}",
-            photo.fingerprint,
-            if preview { "preview" } else { "thumb" }
-        );
-        if self.failed.contains(&key)
-            || self.pending.contains(&key)
-            || (if preview {
-                &self.previews
-            } else {
-                &self.thumbnails
-            })
-            .contains_key(&photo.fingerprint)
+    /// Called for every visible tile on every frame, so the common cases
+    /// (already loaded, or no free job) return before allocating anything.
+    fn request_image(&mut self, photo: &Arc<Photo>, preview: bool, cx: &mut Context<Self>) {
+        if (if preview {
+            &self.previews
+        } else {
+            &self.thumbnails
+        })
+        .contains_key(&photo.fingerprint)
         {
             return;
         }
@@ -2109,12 +2104,21 @@ impl PhotosApp {
         {
             return;
         }
+        let key = format!(
+            "{}-{}",
+            photo.fingerprint,
+            if preview { "preview" } else { "thumb" }
+        );
+        if self.failed.contains(&key) || self.pending.contains(&key) {
+            return;
+        }
         let Some(driver) = self.driver.clone() else {
             return;
         };
         self.pending.insert(key.clone());
         let generation = self.generation;
         let fingerprint = photo.fingerprint.clone();
+        let photo = photo.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -2817,7 +2821,7 @@ impl PhotosApp {
     }
     fn tile(
         &mut self,
-        photo: &Photo,
+        photo: &Arc<Photo>,
         index: usize,
         layout: &GalleryLayout,
         c: Colors,
@@ -2833,9 +2837,10 @@ impl PhotosApp {
         let request_entity = cx.entity();
         let selected = self.selected.contains(&photo.id);
         let thumb = self.thumbnails.get(&photo.fingerprint).cloned();
-        let failed = self
-            .failed
-            .contains(&format!("{}-thumb", photo.fingerprint));
+        let failed = thumb.is_none()
+            && self
+                .failed
+                .contains(&format!("{}-thumb", photo.fingerprint));
         let drag = DragPhotos {
             ids: Default::default(),
             seed: photo.id.clone(),
@@ -2897,7 +2902,7 @@ impl PhotosApp {
                         canvas(
                             move |_, _, cx| {
                                 request_entity.update(cx, |this, cx| {
-                                    this.request_image(request_photo, false, cx)
+                                    this.request_image(&request_photo, false, cx)
                                 });
                             },
                             |_, _, _, _| {},
@@ -3451,7 +3456,7 @@ impl PhotosApp {
             );
         }
         for photo in missing {
-            self.request_image(photo.as_ref().clone(), false, cx);
+            self.request_image(&photo, false, cx);
         }
         if painted {
             self.pump_tiles(cx);
@@ -3957,7 +3962,7 @@ impl PhotosApp {
                                     if this.pending.len() >= THUMBNAIL_JOBS {
                                         break;
                                     }
-                                    this.request_image(photo.as_ref().clone(), false, cx);
+                                    this.request_image(&photo, false, cx);
                                 }
                             })
                         },
@@ -4221,7 +4226,7 @@ impl PhotosApp {
             .flex_col()
             .bg(rgb(c.bg));
         if let Some(photo) = photo {
-            self.request_image(photo.clone(), true, cx);
+            self.request_image(&photo, true, cx);
             let motion = self.motion_path(&photo, true, cx);
             let thumbnail_path = self.thumbnails.get(&photo.fingerprint).cloned();
             let preview_path = self.previews.get(&photo.fingerprint).cloned();
@@ -4285,7 +4290,7 @@ impl PhotosApp {
                                 .update(cx, |cache, cx| cache.load(&Resource::from(path), w, cx));
                         }
                         None if !self.pending.iter().any(|k| k.ends_with("-preview")) => {
-                            self.request_image(neighbour.as_ref().clone(), true, cx)
+                            self.request_image(&neighbour, true, cx)
                         }
                         None => (),
                     }
@@ -4546,7 +4551,7 @@ impl PhotosApp {
                                                     .on_click(cx.listener(
                                                         move |this, _, w, cx| {
                                                             this.play_externally(
-                                                                external.clone(),
+                                                                external.as_ref().clone(),
                                                                 w,
                                                                 cx,
                                                             )
@@ -4637,7 +4642,7 @@ impl PhotosApp {
                                         .object_fit(ObjectFit::Contain),
                                 );
                             }
-                            self.request_image(photo.as_ref().clone(), false, cx);
+                            self.request_image(&photo, false, cx);
                             if let Some(path) = self.thumbnails.get(&photo.fingerprint).cloned() {
                                 return d.child(
                                     img(Arc::<std::path::Path>::from(path))
@@ -5849,7 +5854,7 @@ impl Render for PhotosApp {
                                 .items_center()
                                 .justify_center()
                                 .gap_3()
-                                .child(div().truncate().min_w_0().child(photo.name))
+                                .child(div().truncate().min_w_0().child(photo.name.clone()))
                                 .child(div().w(px(1.)).h(px(14.)).flex_shrink_0().bg(rgb(c.border)))
                                 .child(div().flex_shrink_0().child(
                                     match photo.duration.filter(|s| *s > 0.) {
@@ -6144,3 +6149,21 @@ pub fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests;
+
+/// `haystack.to_lowercase().contains(needle)` for an already-lowercased
+/// needle, without allocating for ASCII text (file names, ids, most captions).
+/// Search runs this over every photo on each keystroke.
+fn contains_folded(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.is_ascii() {
+        haystack.len() >= needle.len()
+            && haystack
+                .as_bytes()
+                .windows(needle.len())
+                .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+    } else {
+        haystack.to_lowercase().contains(needle)
+    }
+}
