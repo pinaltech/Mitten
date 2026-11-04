@@ -417,22 +417,19 @@ impl PhotosApp {
             })
     }
     /// "Oct 25th, 2024 – Nov 15th, 2024" for the photos on screen.
-    fn visible_dates(&self, cx: &App) -> Option<String> {
+    pub(super) fn visible_dates(&self, cx: &App) -> Option<String> {
         let photos = self.visible(cx);
         if photos.is_empty() {
             return None;
         }
         let layout = self.gallery_layout(cx);
-        let scroll = self.scroll_handle();
-        let height = f32::from(scroll.bounds().size.height);
-        let top = f32::from(-scroll.offset().y).max(0.);
+        // The offset the grid will settle on this frame, not the one it had:
+        // while catalog pages arrive the grid re-anchors after each one, and
+        // reading the stale offset showed other photos' dates for a frame.
+        let viewport = self.grid_viewport(&layout);
+        let top = self.grid_offset(&layout, &photos, viewport);
         // Before the grid's first layout, the top of the view stands in.
-        let bottom = top
-            + if height > 1. {
-                height
-            } else {
-                self.gallery_height.max(400.)
-            };
+        let bottom = top + if viewport > 1. { viewport } else { 400. };
         let mut range: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> =
             None;
         for span in layout.visible(top, bottom) {

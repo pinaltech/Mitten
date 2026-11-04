@@ -3791,6 +3791,42 @@ impl PhotosApp {
         let step = ZoomInput::Step(if larger { 1 } else { -1 });
         self.zoom_library(step, false, cx);
     }
+    /// The height of the grid's visible area.
+    fn grid_viewport(&self, layout: &GalleryLayout) -> f32 {
+        if self.gallery_height > 0. {
+            self.gallery_height.min(layout.height)
+        } else {
+            f32::from(self.scroll_handle().bounds().size.height)
+        }
+        .max(1.)
+    }
+    /// The grid's scroll offset for this frame, with any pending reset or
+    /// anchor restore (after a catalog page, resize or direction change)
+    /// applied. The grid commits it; the header reads it before the grid is
+    /// built, so both describe the same photos in the same frame.
+    fn grid_offset(&self, layout: &GalleryLayout, photos: &PhotoView, viewport: f32) -> f32 {
+        let max = (layout.height - viewport).max(0.);
+        let end = if self.preferences.bottom_to_top {
+            max
+        } else {
+            0.
+        };
+        if self.gallery_reset {
+            return end;
+        }
+        match &self.gallery_restore {
+            Some(anchor) if anchor.end => end,
+            Some(anchor) => {
+                let index = self
+                    .photo_index
+                    .get(&anchor.id)
+                    .and_then(|&i| photos.position(i))
+                    .unwrap_or(anchor.fallback.min(photos.len().saturating_sub(1)));
+                (layout.cell(index).y + anchor.within * layout.edge - anchor.screen).clamp(0., max)
+            }
+            None => self.gallery_offset().min(max),
+        }
+    }
     fn grid_view(&mut self, available: f32, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
         if (self.gallery_width - available).abs() > 0.5 {
             self.preserve_gallery(cx);
@@ -3831,34 +3867,13 @@ impl PhotosApp {
             ));
         } else {
             let handle = self.scroll_handle();
-            let viewport = if self.gallery_height > 0. {
-                self.gallery_height.min(layout.height)
-            } else {
-                f32::from(handle.bounds().size.height)
-            }
-            .max(1.);
-            let max = (layout.height - viewport).max(0.);
-            let end = if bottom_up { max } else { 0. };
-            if self.gallery_reset {
-                self.set_gallery_offset(end);
+            let viewport = self.grid_viewport(&layout);
+            let offset = self.grid_offset(&layout, &photos, viewport);
+            if self.gallery_reset || self.gallery_restore.is_some() {
+                self.set_gallery_offset(offset);
                 self.gallery_reset = false;
                 self.gallery_restore = None;
-            } else if let Some(anchor) = self.gallery_restore.take() {
-                if anchor.end {
-                    self.set_gallery_offset(end);
-                } else {
-                    let index = self
-                        .photo_index
-                        .get(&anchor.id)
-                        .and_then(|&i| photos.position(i))
-                        .unwrap_or(anchor.fallback.min(photos.len() - 1));
-                    let offset = (layout.cell(index).y + anchor.within * layout.edge
-                        - anchor.screen)
-                        .clamp(0., max);
-                    self.set_gallery_offset(offset);
-                }
             }
-            let offset = self.gallery_offset().min(max);
             // A photo closing from the viewer flies to its tile as laid out now.
             if let Some(id) = self
                 .closing

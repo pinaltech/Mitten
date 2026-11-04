@@ -2117,3 +2117,78 @@ fn search_matching_folds_case_like_to_lowercase() {
         );
     }
 }
+
+/// Each catalog page re-anchors the grid. The header is built before the grid
+/// in the same frame, so it must already show the dates the grid settles on,
+/// not those at the old scroll offset (which flickered for a frame per page).
+#[gpui::test]
+fn header_dates_do_not_flicker_while_cataloging(cx: &mut TestAppContext) {
+    cx.update(ui::init);
+    let data = tempfile::tempdir().unwrap();
+    let driver: Arc<dyn PhotosDriver> = Arc::new(
+        desert_photos::sources::ConnectedPhotos::new(
+            Source {
+                driver: "synthetic".into(),
+                path: data.path().join("source"),
+            },
+            Box::new(StressSource(Arc::default())),
+        )
+        .unwrap(),
+    );
+    // Newest first, one day apart, so every row has its own dates.
+    let dated = |range: std::ops::Range<usize>| {
+        let base = chrono::Utc::now();
+        synthetic_photos(range.clone())
+            .into_iter()
+            .zip(range)
+            .map(|(p, i)| {
+                Arc::new(Photo {
+                    modified: base - chrono::Duration::days(i as i64),
+                    ..p.as_ref().clone()
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut app = None;
+    let window = cx.add_window(|w, cx| {
+        let entity = cx.new(|cx| {
+            let mut app = PhotosApp::new(data.path().join("settings.json"), w, cx);
+            app.driver = Some(driver);
+            app.library.photos = dated(0..600);
+            app.library_changed();
+            app
+        });
+        app = Some(entity.clone());
+        Root::new(entity, w, cx)
+    });
+    let app = app.unwrap();
+    let cx = VisualTestContext::from_window(window.into(), cx).into_mut();
+    cx.simulate_resize(size(px(1060.), px(760.)));
+    frame(cx);
+    let mut pages = 600..800;
+    // Pinned to the newest photos, then browsing older ones mid-library.
+    for browse in [None, Some(3000.)] {
+        if let Some(offset) = browse {
+            app.update_in(cx, |app, _, cx| {
+                app.set_gallery_offset(offset);
+                cx.notify();
+            });
+            frame(cx);
+        }
+        for _ in 0..3 {
+            let page = pages.start..pages.start + 200;
+            pages.start += 200;
+            let before_grid = app.update_in(cx, |app, _, cx| {
+                app.preserve_gallery(cx);
+                app.library.photos.extend(dated(page));
+                app.library_changed();
+                cx.notify();
+                app.visible_dates(cx)
+            });
+            frame(cx);
+            let settled = app.read_with(cx, |app, cx| app.visible_dates(cx));
+            assert!(settled.is_some());
+            assert_eq!(before_grid, settled);
+        }
+    }
+}
