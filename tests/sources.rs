@@ -504,6 +504,69 @@ mod remote {
         assert!(query.contains("<ns:firstresult>400</ns:firstresult>"));
     }
     #[test]
+    fn immich_favorites_descriptions_and_albums_write_back_to_the_server() {
+        let photo = "00000000-0000-4000-8000-000000000001";
+        let album = "00000000-0000-4000-8000-0000000000aa";
+        let server = Server::new(move |r| {
+            let body = match (r.method.as_str(), r.path.as_str()) {
+                ("GET", "/api/albums") => {
+                    json!([{"id": album, "albumName": "Trip", "assetCount": 1}])
+                }
+                ("GET", "/api/albums?shared=true") => json!([]),
+                ("GET", p) if p == format!("/api/albums/{album}") => {
+                    json!({"id": album, "assetCount": 1, "assets": [{"id": photo}]})
+                }
+                ("POST", "/api/albums") => json!({"id": "00000000-0000-4000-8000-0000000000bb"}),
+                _ => json!({}),
+            };
+            (200, body.to_string().into_bytes())
+        });
+        let remote = Remote::new(config(&server, "immich"), "key").unwrap();
+        assert!(remote.writable());
+        let albums = remote.albums().unwrap();
+        assert!(albums["Trip"].contains(photo));
+        remote.set_favorite(&[photo.to_owned()], true).unwrap();
+        remote.set_description(photo, "Sunset").unwrap();
+        remote.add_to_album("Trip", &[photo.to_owned()]).unwrap();
+        remote
+            .remove_from_album("Trip", &[photo.to_owned()])
+            .unwrap();
+        remote.create_album("New").unwrap();
+        remote.add_to_album("New", &[photo.to_owned()]).unwrap();
+        assert!(remote.add_to_album("Missing", &[photo.to_owned()]).is_err());
+        let requests = server.requests.lock().unwrap().clone();
+        let find = |method: &str, path: &str| {
+            requests
+                .iter()
+                .find(|r| r.method == method && r.path == path)
+                .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).unwrap())
+                .unwrap_or_else(|| panic!("no {method} {path}"))
+        };
+        assert_eq!(find("PUT", "/api/assets")["isFavorite"], true);
+        assert_eq!(
+            find("PUT", &format!("/api/assets/{photo}"))["description"],
+            "Sunset"
+        );
+        assert_eq!(
+            find("PUT", &format!("/api/albums/{album}/assets"))["ids"][0],
+            photo
+        );
+        assert_eq!(
+            find("DELETE", &format!("/api/albums/{album}/assets"))["ids"][0],
+            photo
+        );
+        assert_eq!(find("POST", "/api/albums")["albumName"], "New");
+        find(
+            "PUT",
+            "/api/albums/00000000-0000-4000-8000-0000000000bb/assets",
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.headers.contains("x-api-key: key"))
+        );
+    }
+    #[test]
     fn authentication_and_thumbnail_failures_never_fall_back_to_originals() {
         for status in [401, 403, 404, 429, 500, 302] {
             let server = Server::new(move |_| (status, b"error".to_vec()));

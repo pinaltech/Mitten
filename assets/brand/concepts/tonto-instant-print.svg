@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="540" viewBox="0 0 640 540" role="img" aria-labelledby="title desc">
+<title id="title">Tonto — Instant Print</title>
+<desc id="desc">An instant-film print whose thick lower margin rests on the horizon, with three ponderosa pines and a low sun inside the photo window.</desc>
+<defs>
+<linearGradient id="mark" x1="40" y1="60" x2="600" y2="400" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#35CD58"/><stop offset="0.55" stop-color="#18B965"/><stop offset="1" stop-color="#008D77"/></linearGradient>
+<linearGradient id="base"><stop offset="0" stop-color="#003D40"/><stop offset="1" stop-color="#005353"/></linearGradient>
+<clipPath id="above"><path d="M0 0H640V396H600Q600 403 592 397C550 362 493 339 432 327Q320 306 208 327C147 339 90 362 48 397Q40 403 40 396H0Z"/></clipPath>
+
+</defs>
+<g clip-path="url(#above)" fill="url(#mark)">
+<path fill-rule="evenodd" d="M150 44H490A30 30 0 0 1 520 74V470H120V74A30 30 0 0 1 150 44ZM168 80H472Q484 80 484 92V264H156V92Q156 80 168 80Z"/>
+<path d="M260 266L290 194H273.2L320 106L366.8 194H350L380 266Z M196 266L217 217.4H205.24L238 158L270.76 217.4H259L280 266Z M358 266L381 212.9H368.12L404 148L439.88 212.9H427L450 266Z"/>
+<circle cx="196" cy="124" r="22"/>
+</g>
+<path id="horizon" d="M40 500A280 142 0 0 1 600 500Z" fill="url(#base)"/>
+</svg>

@@ -90,6 +90,7 @@ fn main() {
         "AVFoundation",
         "AVKit",
         "CoreMedia",
+        "CoreLocation",
     ] {
         println!("cargo:rustc-link-lib=framework={framework}");
     }

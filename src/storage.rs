@@ -39,6 +39,27 @@ pub struct Preferences {
     pub bottom_to_top: bool,
     #[serde(default)]
     pub catalog_counts: BTreeMap<PathBuf, usize>,
+    /// Measure each library's loading speed to pick image sizes.
+    #[serde(default = "default_true")]
+    pub automatic_sizes: bool,
+    /// Sizes chosen by hand (used when `automatic_sizes` is off).
+    #[serde(default)]
+    pub image_sizes: crate::loading::ImageSizes,
+    /// Sizes measured for each library.
+    #[serde(default)]
+    pub measured_sizes: BTreeMap<PathBuf, crate::loading::ImageSizes>,
+    /// Show a map of where a photo was taken in its info panel.
+    #[serde(default = "default_true")]
+    pub show_map: bool,
+    /// Raster tile URL template with {z}, {x} and {y}.
+    #[serde(default = "default_map_tiles")]
+    pub map_tiles: String,
+}
+fn default_true() -> bool {
+    true
+}
+pub fn default_map_tiles() -> String {
+    "https://tile.openstreetmap.org/{z}/{x}/{y}.png".into()
 }
 fn default_bottom_to_top() -> bool {
     true
@@ -55,10 +76,25 @@ impl Default for Preferences {
             accent: default_accent(),
             catalog_counts: BTreeMap::new(),
             bottom_to_top: true,
+            automatic_sizes: true,
+            image_sizes: Default::default(),
+            measured_sizes: BTreeMap::new(),
+            show_map: true,
+            map_tiles: default_map_tiles(),
         }
     }
 }
 impl Preferences {
+    /// The image sizes to use for the library at `path`.
+    pub fn sizes_for(&self, path: Option<&Path>) -> crate::loading::ImageSizes {
+        if !self.automatic_sizes {
+            return self.image_sizes.clamped();
+        }
+        path.and_then(|p| self.measured_sizes.get(p))
+            .copied()
+            .unwrap_or_default()
+            .clamped()
+    }
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -84,6 +120,7 @@ impl Preferences {
     pub fn remove(&mut self, source: &Source) {
         self.sources.retain(|s| s != source);
         self.catalog_counts.remove(&source.path);
+        self.measured_sizes.remove(&source.path);
         if self.active.as_ref() == Some(&source.path) {
             self.active = self.sources.first().map(|s| s.path.clone());
         }
@@ -119,6 +156,178 @@ pub enum VideoSource {
     File(PathBuf),
     /// A PhotoKit local identifier.
     PhotoKit(String),
+    /// A server stream, with the headers that authorize it.
+    Remote {
+        url: String,
+        headers: Vec<(String, String)>,
+    },
+}
+/// Someone a source recognised in photos (Immich face recognition).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct Person {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+}
+/// A place photos were taken, with one photo to represent it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Place {
+    pub name: String,
+    pub photo: String,
+}
+/// Photos a source can find for the Explore view.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Query {
+    Person(String),
+    Place(String),
+}
+/// Everything the info panel shows beyond the catalog: capture settings,
+/// camera, location and people. Each source fills what its metadata has.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct PhotoDetails {
+    pub description: Option<String>,
+    /// Local capture time as the camera recorded it.
+    pub taken: Option<chrono::NaiveDateTime>,
+    /// Its UTC offset, such as "+02:00", or a time zone name.
+    pub zone: Option<String>,
+    pub make: Option<String>,
+    pub model: Option<String>,
+    pub lens: Option<String>,
+    pub f_number: Option<f32>,
+    /// Shutter speed in seconds.
+    pub exposure: Option<f32>,
+    pub iso: Option<u32>,
+    pub focal_length: Option<f32>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    /// Place names from most to least specific (city, region, country).
+    pub place: Vec<String>,
+    pub bytes: Option<u64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub people: Vec<Person>,
+}
+impl PhotoDetails {
+    /// "Apple iPhone 15 Pro": the make is left out when the model repeats it.
+    pub fn camera(&self) -> Option<String> {
+        let model = self
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let make = self
+            .make
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        match (make, model) {
+            (Some(make), Some(model)) if model.to_lowercase().starts_with(&make.to_lowercase()) => {
+                Some(model.to_owned())
+            }
+            (Some(make), Some(model)) => Some(format!("{make} {model}")),
+            (make, model) => make.or(model).map(str::to_owned),
+        }
+    }
+    /// "ƒ/1.8 · 1/120 s · 6.9 mm · ISO 80"
+    pub fn exposure_line(&self) -> Option<String> {
+        let mut parts = vec![];
+        if let Some(f) = self.f_number.filter(|f| *f > 0.) {
+            parts.push(format!("ƒ/{}", trim_float(f, 1)));
+        }
+        if let Some(t) = self.exposure.filter(|t| *t > 0.) {
+            parts.push(if t < 1. {
+                format!("1/{} s", (1. / t).round())
+            } else {
+                format!("{} s", trim_float(t, 1))
+            });
+        }
+        if let Some(mm) = self.focal_length.filter(|f| *f > 0.) {
+            parts.push(format!("{} mm", trim_float(mm, 1)));
+        }
+        if let Some(iso) = self.iso.filter(|i| *i > 0) {
+            parts.push(format!("ISO {iso}"));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+    pub fn coordinates(&self) -> Option<(f64, f64)> {
+        let (lat, lon) = (self.latitude?, self.longitude?);
+        ((-90. ..=90.).contains(&lat)
+            && (-180. ..=180.).contains(&lon)
+            && !(lat == 0. && lon == 0.))
+            .then_some((lat, lon))
+    }
+}
+fn trim_float(value: f32, places: usize) -> String {
+    let s = format!("{value:.places$}");
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_owned()
+    } else {
+        s
+    }
+}
+/// Capture details from a file's EXIF block (JPEG, TIFF, HEIF, PNG, WebP).
+pub fn exif_details(path: &Path) -> PhotoDetails {
+    let mut details = PhotoDetails::default();
+    let Ok(file) = fs::File::open(path) else {
+        return details;
+    };
+    let Ok(exif) = exif::Reader::new().read_from_container(&mut std::io::BufReader::new(file))
+    else {
+        return details;
+    };
+    use exif::{In, Tag, Value};
+    let field = |tag| exif.get_field(tag, In::PRIMARY);
+    let text = |tag| {
+        field(tag).and_then(|f| match &f.value {
+            Value::Ascii(v) => v
+                .first()
+                .map(|s| {
+                    String::from_utf8_lossy(s)
+                        .trim()
+                        .trim_matches('\0')
+                        .to_owned()
+                })
+                .filter(|s| !s.is_empty()),
+            _ => None,
+        })
+    };
+    let number = |tag| {
+        field(tag).and_then(|f| match &f.value {
+            Value::Rational(v) => v.first().map(|r| r.to_f64()),
+            Value::SRational(v) => v.first().map(|r| r.to_f64()),
+            _ => f.value.get_uint(0).map(f64::from),
+        })
+    };
+    details.make = text(Tag::Make);
+    details.model = text(Tag::Model);
+    details.lens = text(Tag::LensModel);
+    details.f_number = number(Tag::FNumber).map(|v| v as f32);
+    details.exposure = number(Tag::ExposureTime).map(|v| v as f32);
+    details.focal_length = number(Tag::FocalLength).map(|v| v as f32);
+    details.iso = field(Tag::PhotographicSensitivity).and_then(|f| f.value.get_uint(0));
+    details.taken = text(Tag::DateTimeOriginal)
+        .or_else(|| text(Tag::DateTime))
+        .and_then(|s| chrono::NaiveDateTime::parse_from_str(&s, "%Y:%m:%d %H:%M:%S").ok());
+    details.zone = text(Tag::OffsetTimeOriginal).or_else(|| text(Tag::OffsetTime));
+    details.description = text(Tag::ImageDescription);
+    let degrees = |tag, reference, negative: &str| {
+        let value = match &field(tag)?.value {
+            Value::Rational(v) if v.len() >= 3 => {
+                v[0].to_f64() + v[1].to_f64() / 60. + v[2].to_f64() / 3600.
+            }
+            _ => return None,
+        };
+        let sign = if text(reference).is_some_and(|r| r.eq_ignore_ascii_case(negative)) {
+            -1.
+        } else {
+            1.
+        };
+        value.is_finite().then_some(sign * value)
+    };
+    details.latitude = degrees(Tag::GPSLatitude, Tag::GPSLatitudeRef, "S");
+    details.longitude = degrees(Tag::GPSLongitude, Tag::GPSLongitudeRef, "W");
+    details
 }
 #[derive(Clone, Debug, Default)]
 pub struct ImportReport {
@@ -175,6 +384,74 @@ pub trait PhotosDriver: Send + Sync {
     fn squares(&self, photos: &[Arc<Photo>], edge: u32) -> Vec<Result<Vec<u8>>> {
         squares_from_thumbnails(self, photos, edge)
     }
+    /// Renders `photo` at `edge` without caching it, for timing how fast
+    /// this source delivers each size.
+    fn sample(&self, _photo: &Photo, _edge: u32) -> Result<()> {
+        bail!("This source cannot be measured")
+    }
+    /// Capture details for the info panel.
+    fn details(&self, _photo: &Photo) -> Result<PhotoDetails> {
+        Ok(PhotoDetails::default())
+    }
+    /// A local file of a video, for playing it in the system's player.
+    fn video_file(&self, photo: &Photo) -> Result<PathBuf> {
+        match self.video(photo) {
+            Some(VideoSource::File(path)) => Ok(path),
+            _ => bail!("This video cannot be opened here"),
+        }
+    }
+    /// Whether this source has people and places to explore.
+    fn explore(&self) -> bool {
+        false
+    }
+    fn people(&self) -> Result<Vec<Person>> {
+        Ok(vec![])
+    }
+    fn person_thumbnail(&self, _id: &str) -> Result<PathBuf> {
+        bail!("This source has no people")
+    }
+    fn places(&self) -> Result<Vec<Place>> {
+        Ok(vec![])
+    }
+    /// IDs of the photos matching an Explore query.
+    fn matching(&self, _query: &Query) -> Result<Vec<String>> {
+        Ok(vec![])
+    }
+    /// IDs of the photos the source's own search finds for `text` (beyond
+    /// names and captions), or `None` when it has no search.
+    fn search(&self, _text: &str) -> Result<Option<Vec<String>>> {
+        Ok(None)
+    }
+}
+/// Times `driver` rendering a few `photos` at each candidate size and keeps
+/// the largest that stays quick (see [`crate::loading::fastest_reasonable`]).
+/// Squares stay at their defaults: they come from these thumbnails.
+pub fn measure_sizes(
+    driver: &dyn PhotosDriver,
+    photos: &[Arc<Photo>],
+) -> crate::loading::ImageSizes {
+    use crate::loading::{GRID_BUDGET, ImageSizes, VIEWER_BUDGET, fastest_reasonable};
+    let stills: Vec<_> = photos
+        .iter()
+        .filter(|p| p.duration.is_none() && !p.deleted)
+        .collect();
+    // Spread samples across the library rather than its newest few.
+    let samples: Vec<&Arc<Photo>> = (0..3)
+        .filter_map(|i| stills.get(i * stills.len() / 3))
+        .copied()
+        .collect();
+    let mut sizes = ImageSizes::DEFAULT;
+    if samples.is_empty() {
+        return sizes;
+    }
+    let mut time = |edge: u32, i: usize| {
+        let started = std::time::Instant::now();
+        driver.sample(samples.get(i)?, edge).ok()?;
+        Some(started.elapsed())
+    };
+    sizes.grid = fastest_reasonable(&ImageSizes::GRID, samples.len(), GRID_BUDGET, &mut time);
+    sizes.viewer = fastest_reasonable(&ImageSizes::VIEWER, samples.len(), VIEWER_BUDGET, &mut time);
+    sizes
 }
 
 /// Squares cropped from each photo's grid thumbnail, cached beside it.
@@ -513,10 +790,38 @@ impl PhotosDriver for LocalPhotos {
         })
     }
     fn thumbnail(&self, photo: &Photo) -> Result<PathBuf> {
-        self.decode(photo, 512, "thumb")
+        let edge = crate::loading::image_sizes().grid;
+        self.decode(photo, edge, &crate::loading::sized_kind("thumb", edge))
     }
     fn preview(&self, photo: &Photo) -> Result<PathBuf> {
-        self.decode(photo, 2560, "preview")
+        let edge = crate::loading::image_sizes().viewer;
+        self.decode(photo, edge, &crate::loading::sized_kind("preview", edge))
+    }
+    fn sample(&self, photo: &Photo, edge: u32) -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = self.original(&photo.id)?;
+        let target = directory.path().join("sample.jpg");
+        if crate::native_image::thumbnail(&path, &target, edge) {
+            return Ok(());
+        }
+        let image = image::ImageReader::open(path)?
+            .with_guessed_format()?
+            .decode()?;
+        image
+            .thumbnail(edge, edge)
+            .to_rgb8()
+            .save_with_format(&target, image::ImageFormat::Jpeg)?;
+        Ok(())
+    }
+    fn details(&self, photo: &Photo) -> Result<PhotoDetails> {
+        let path = self.original(&photo.id)?;
+        let mut details = if photo.duration.is_none() {
+            exif_details(&path)
+        } else {
+            PhotoDetails::default()
+        };
+        details.bytes = Some(photo.bytes);
+        Ok(details)
     }
     fn squares(&self, photos: &[Arc<Photo>], edge: u32) -> Vec<Result<Vec<u8>>> {
         photos

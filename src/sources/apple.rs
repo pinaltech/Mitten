@@ -19,6 +19,7 @@ unsafe extern "C" {
         ok: *mut u8,
     ) -> *mut c_char;
     fn dp_photos_albums() -> *mut c_char;
+    fn dp_photos_details(id: *const c_char) -> *mut c_char;
     fn dp_photos_free(value: *mut c_char);
 }
 pub struct ApplePhotos;
@@ -82,16 +83,18 @@ impl Provider for ApplePhotos {
         })
     }
     fn image(&self, photo: &Photo, preview: bool, destination: &Path) -> Result<()> {
+        self.image_at(photo, if preview { 2560 } else { 512 }, destination)
+    }
+    fn image_at(&self, photo: &Photo, edge: u32, destination: &Path) -> Result<()> {
         let id = CString::new(photo.id.as_str())?;
         let path = CString::new(destination.as_os_str().as_encoded_bytes())?;
-        unsafe {
-            result(dp_photos_image(
-                id.as_ptr(),
-                path.as_ptr(),
-                if preview { 2560 } else { 512 },
-            ))
-        }?;
+        unsafe { result(dp_photos_image(id.as_ptr(), path.as_ptr(), edge)) }?;
         Ok(())
+    }
+    fn details(&self, photo: &Photo) -> Result<crate::storage::PhotoDetails> {
+        let id = CString::new(photo.id.as_str())?;
+        let value = unsafe { result(dp_photos_details(id.as_ptr())) }?;
+        Ok(serde_json::from_value(value)?)
     }
     /// Photos keeps small thumbnails for every asset; reading those (fast
     /// format, no download) is far quicker than rendering 512 px previews.

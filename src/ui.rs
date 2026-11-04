@@ -4,6 +4,7 @@ use desert_photos::gallery::{
     zoom::{self, Crossfade, Input as ZoomInput, Ladder, Lattice, Layer, Placement, Zoom},
 };
 use desert_photos::loading::{BoundedCache, Square, THUMBNAIL_CACHE, THUMBNAIL_JOBS, VIEWER_CACHE};
+use desert_photos::map;
 use desert_photos::sources::{Connection, PhotoPage, ProviderKind};
 use desert_photos::storage::{self, Library, Photo, PhotosDriver, Preferences, Source};
 use desert_ui::{self as ui, Accent, Colors, library as kit};
@@ -57,6 +58,11 @@ enum Filter {
     Recent,
     Trash,
     Album(String),
+    /// People and places (sources with face recognition and geocoding).
+    Explore,
+    /// Photos of one person: ID and name.
+    Person(String, String),
+    Place(String),
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Modal {
@@ -114,10 +120,13 @@ struct Marquee {
     baseline: BTreeSet<String>,
 }
 mod assets;
+mod explore;
 mod image_cache;
+mod info;
 mod native_drag;
 mod photo_view;
 mod progress;
+mod settings;
 mod tiles;
 mod video;
 fn provider_logo(provider: ProviderKind, c: Colors) -> AnyElement {
@@ -204,7 +213,9 @@ fn zoom_image(
     if !dense || pixels > 170. {
         thumbnail().or_else(|| tiles.peek(photo))
     } else {
-        tiles.get(photo, Square::for_pixels(pixels)).or_else(thumbnail)
+        tiles
+            .get(photo, Square::for_pixels(pixels))
+            .or_else(thumbnail)
     }
 }
 fn aspect_of(
@@ -298,8 +309,8 @@ fn section_label(tier: Tier, key: i32, k: f32, c: Colors) -> Div {
         })
 }
 /// Height of the title row a layout shows above the grid.
-fn gallery_title(layout: &GalleryLayout) -> f32 {
-    if layout.full_bleed() { 0. } else { 84. }
+fn gallery_title(_layout: &GalleryLayout) -> f32 {
+    0.
 }
 /// Width of a margined tile's border: its photo sits this far inside its
 /// frame, and a selected tile draws its accent ring there.
@@ -504,7 +515,33 @@ pub struct PhotosApp {
     generation: u64,
     scan_epoch: u64,
     scroll: UniformListScrollHandle,
+    map_url: Entity<InputState>,
+    custom_map: bool,
+    measuring: bool,
+    sizes_dirty: bool,
+    // Info panel: the shown photo's details, its map and people's faces.
+    details: Option<(String, Arc<storage::PhotoDetails>)>,
+    details_pending: Option<String>,
+    map: Option<(String, Option<PathBuf>)>,
+    map_pending: Option<String>,
+    faces: HashMap<String, Option<PathBuf>>,
+    faces_pending: BTreeSet<String>,
+    caption_for: Option<String>,
+    // Explore (people and places) and the photos of the one chosen.
+    explore: Option<Explore>,
+    explore_pending: bool,
+    all_people: bool,
+    query_ids: Option<(Filter, Arc<std::collections::HashSet<String>>)>,
+    query_pending: Option<Filter>,
+    // The source's own search results for the current query.
+    remote_search: Option<(String, Arc<std::collections::HashSet<String>>)>,
+    search_epoch: u64,
     _subscriptions: Vec<Subscription>,
+}
+#[derive(Clone, Default)]
+struct Explore {
+    people: Vec<storage::Person>,
+    places: Vec<storage::Place>,
 }
 impl PhotosApp {
     fn new(config_path: PathBuf, w: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -519,10 +556,12 @@ impl PhotosApp {
             e.set_value("100%", w, cx);
             e
         });
-        let caption = cx.new(|cx| {
-            InputState::new(w, cx)
-                .multi_line(true)
-                .placeholder("Add a caption…")
+        let caption = cx.new(|cx| InputState::new(w, cx).placeholder("Add a description"));
+        let map_url = cx.new(|cx| {
+            let mut e =
+                InputState::new(w, cx).placeholder("https://tiles.example.com/{z}/{x}/{y}.png");
+            e.set_value(preferences.map_tiles.clone(), w, cx);
+            e
         });
         let mut subscriptions = vec![
             cx.subscribe_in(&zoom_input, w, |this, _, event, w, cx| {
@@ -549,7 +588,37 @@ impl PhotosApp {
                     this.selected.clear();
                     this.anchor = None;
                     this.viewer = None;
+                    if this.filter == Filter::Explore {
+                        this.filter = Filter::All;
+                    }
                     this.reset_gallery();
+                    this.search_source(cx);
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&caption, w, |this, _, event, w, cx| {
+                if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    this.save_caption(cx);
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        this.focus.focus(w);
+                    }
+                }
+            }),
+            cx.subscribe_in(&map_url, w, |this, _, event, _, cx| {
+                if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    let url = this.map_url.read(cx).value().trim().to_string();
+                    if url == this.preferences.map_tiles {
+                        return;
+                    }
+                    if map::valid_template(&url) {
+                        this.preferences.map_tiles = url;
+                        this.error = None;
+                        this.map = None;
+                        this.save_preferences();
+                    } else {
+                        this.error =
+                            Some("Enter an http(s) tile address with {z}, {x} and {y}.".into());
+                    }
                     cx.notify();
                 }
             }),
@@ -673,6 +742,24 @@ impl PhotosApp {
             generation: 0,
             scan_epoch: 0,
             scroll: UniformListScrollHandle::new(),
+            map_url,
+            custom_map: false,
+            measuring: false,
+            sizes_dirty: false,
+            details: None,
+            details_pending: None,
+            map: None,
+            map_pending: None,
+            faces: HashMap::new(),
+            faces_pending: BTreeSet::new(),
+            caption_for: None,
+            explore: None,
+            explore_pending: false,
+            all_people: false,
+            query_ids: None,
+            query_pending: None,
+            remote_search: None,
+            search_epoch: 0,
             _subscriptions: subscriptions,
         };
         this.theme(w, cx);
@@ -720,12 +807,19 @@ impl PhotosApp {
         .detach();
         #[cfg(not(test))]
         cx.spawn_in(w, async move |this, cx| {
+            let mut tick = 0u32;
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(16))
                     .await;
+                tick = tick.wrapping_add(1);
                 if this
                     .update_in(cx, |this, w, cx| {
+                        // A few times a second: recover the window if it is
+                        // frontmost but stuck not key (no hover, typing beeps).
+                        if tick.is_multiple_of(12) && video::restore_key_window(w) {
+                            cx.notify();
+                        }
                         let gesture = ui::native_transfer::take_magnify_gesture(w);
                         if gesture.began && this.viewer.is_some() {
                             this.viewer_pinch_began();
@@ -957,7 +1051,22 @@ impl PhotosApp {
                     return;
                 }
                 self.preferences = preferences;
+                desert_photos::loading::set_image_sizes(
+                    self.preferences.sizes_for(Some(&driver.source().path)),
+                );
                 self.driver = Some(driver);
+                self.details = None;
+                self.details_pending = None;
+                self.faces.clear();
+                self.faces_pending.clear();
+                self.caption_for = None;
+                self.explore = None;
+                self.explore_pending = false;
+                self.query_ids = None;
+                self.query_pending = None;
+                self.remote_search = None;
+                self.search_epoch += 1;
+                self.decoded_preview = None;
                 self.library = page.library;
                 self.next_page = page.next;
                 self.has_more = self.next_page.is_some();
@@ -997,6 +1106,7 @@ impl PhotosApp {
                 self.focus.focus(w);
                 self.save_catalog_count();
                 self.load_more(cx);
+                self.measure_sizes(false, cx);
             }
             Err(e) => {
                 self.error = Some(format!("Cannot connect: {e:#}"));
@@ -1363,6 +1473,13 @@ impl PhotosApp {
             return cache.photos.clone();
         }
         let recent_cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+        // The source's own search results for this query, if they arrived.
+        let remote = self
+            .remote_search
+            .as_ref()
+            .filter(|(q, _)| *q == query)
+            .map(|(_, ids)| ids.clone());
+        let remote = remote.as_deref();
         let indices: Vec<usize> = self
             .library
             .photos
@@ -1382,12 +1499,21 @@ impl PhotosApp {
                             .get(a)
                             .is_some_and(|ids| ids.contains(&p.id))
                 }
+                Filter::Explore => false,
+                Filter::Person(..) | Filter::Place(_) => {
+                    !p.deleted
+                        && self
+                            .query_ids
+                            .as_ref()
+                            .is_some_and(|(f, ids)| *f == self.filter && ids.contains(&p.id))
+                }
             })
             .filter(|(_, p)| {
                 query.is_empty()
                     || p.name.to_lowercase().contains(&query)
                     || p.caption.to_lowercase().contains(&query)
                     || p.id.to_lowercase().contains(&query)
+                    || remote.is_some_and(|ids| ids.contains(&p.id))
             })
             .map(|(i, _)| i)
             .collect();
@@ -1406,6 +1532,14 @@ impl PhotosApp {
         photos
     }
     fn set_filter(&mut self, filter: Filter, w: &mut Window, cx: &mut Context<Self>) {
+        self.load_query(&filter, cx);
+        if matches!(
+            filter,
+            Filter::Explore | Filter::Person(..) | Filter::Place(_)
+        ) && !self.search.read(cx).value().is_empty()
+        {
+            self.search.update(cx, |e, cx| e.set_value("", w, cx));
+        }
         self.filter = filter;
         self.selected.clear();
         self.viewer = None;
@@ -1414,16 +1548,6 @@ impl PhotosApp {
         self.reset_gallery();
         self.focus.focus(w);
         cx.notify();
-    }
-    fn title(&self) -> String {
-        match &self.filter {
-            Filter::All => "Library".into(),
-            Filter::Videos => "Videos".into(),
-            Filter::Favorites => "Favorites".into(),
-            Filter::Recent => "Last 30 Days".into(),
-            Filter::Trash => "Recently Deleted".into(),
-            Filter::Album(a) => a.clone(),
-        }
     }
     fn current(&self) -> Option<Photo> {
         self.viewer
@@ -1474,8 +1598,7 @@ impl PhotosApp {
             self.selected = BTreeSet::from([photo.id.clone()]);
             self.anchor = Some(index);
         }
-        self.caption
-            .update(cx, |e, cx| e.set_value(photo.caption.clone(), w, cx));
+        // The info panel loads the description itself (saving any edit first).
         if double {
             self.begin_opening(&photo.id, cx);
             self.selected = BTreeSet::from([photo.id.clone()]);
@@ -1504,8 +1627,6 @@ impl PhotosApp {
             self.viewport.reset();
             self.pan_start = None;
             self.sync_zoom(w, cx);
-            self.caption
-                .update(cx, |e, cx| e.set_value(photo.caption.clone(), w, cx));
             self.request_image(photo, true, cx);
             cx.notify();
         }
@@ -1594,6 +1715,8 @@ impl PhotosApp {
     }
     fn close_viewer(&mut self, gesture: bool, w: &mut Window, cx: &mut Context<Self>) {
         self.opening = None;
+        // The info panel belongs to the photo: it leaves with it.
+        self.inspector = false;
         if let Some(id) = self.viewer.take() {
             let photos = self.visible(cx);
             if let Some(index) = self.photo_index.get(&id).and_then(|&i| photos.position(i)) {
@@ -2526,6 +2649,24 @@ impl PhotosApp {
                 )
                 .on_click(cx.listener(|this, _, w, cx| this.set_filter(Filter::Recent, w, cx))),
             )
+            .when(self.explore_supported(), |d| {
+                d.child(
+                    kit::nav_item(
+                        "explore",
+                        "explore",
+                        "Explore",
+                        None,
+                        matches!(
+                            self.filter,
+                            Filter::Explore | Filter::Person(..) | Filter::Place(_)
+                        ),
+                        c,
+                    )
+                    .on_click(
+                        cx.listener(|this, _, w, cx| this.set_filter(Filter::Explore, w, cx)),
+                    ),
+                )
+            })
             .child(kit::section("Albums", c));
         let mut albums = div()
             .id("albums-scroll")
@@ -2801,7 +2942,7 @@ impl PhotosApp {
                                 .id(SharedString::from(format!("motion-{}", photo.id))),
                         )
                     })
-                    .when_some(photo.duration, |d, seconds| {
+                    .when_some(photo.duration.filter(|s| *s > 0.), |d, seconds| {
                         let text = (frame.w * 0.075).clamp(9., 13.);
                         d.child(
                             div()
@@ -3182,8 +3323,7 @@ impl PhotosApp {
         let goal = z.zoom.goal(z.content.to, &z.ladder);
         z.content.aim(goal, now);
         // Done once the size has landed and that level's photos are in.
-        if z
-            .zoom
+        if z.zoom
             .settled()
             .is_some_and(|slot| z.content.shown(now) == Some(slot))
         {
@@ -3202,15 +3342,27 @@ impl PhotosApp {
         let (ladder, position, center, anchor, area, layers) = {
             let z = self.gallery_zoom.as_ref().unwrap();
             let layers = z.content.layers(now);
-            (z.ladder.clone(), z.zoom.position, z.center, z.anchor.0, z.area, layers)
+            (
+                z.ladder.clone(),
+                z.zoom.position,
+                z.center,
+                z.anchor.0,
+                z.area,
+                layers,
+            )
         };
         let lattice = match ladder.lattice_pair(position) {
             Some((a, b, _)) => {
                 let la = Lattice::of(&self.zoom_frame(ladder.levels[a], cx), anchor);
                 let lb = Lattice::of(&self.zoom_frame(ladder.levels[b], cx), anchor);
-                zoom::lattice_at(&ladder, position, center, |slot| {
-                    if slot == a { la } else { lb }
-                })
+                zoom::lattice_at(
+                    &ladder,
+                    position,
+                    center,
+                    |slot| {
+                        if slot == a { la } else { lb }
+                    },
+                )
             }
             None => None,
         };
@@ -3222,7 +3374,6 @@ impl PhotosApp {
         let mut missing = vec![];
         let mut decode = vec![];
         let mut painted = false;
-        let mut title_opacity = 0.;
         let mut children = Vec::with_capacity(layers.len());
         for (slot, alpha) in layers {
             if alpha <= 0.002 {
@@ -3238,9 +3389,6 @@ impl PhotosApp {
             let layer = Layer::new(&frame, placement, center, anchor);
             let dense = frame.layout.dense();
             painted |= dense;
-            if margined {
-                title_opacity += alpha;
-            }
             let mut tiles: Vec<ZoomTile> = vec![];
             {
                 let cache = self.render_cache.read(cx);
@@ -3258,8 +3406,14 @@ impl PhotosApp {
                         continue;
                     }
                     let pixels = r.w.max(r.h) * self.scale_factor;
-                    let image =
-                        zoom_image(&mut self.tiles, &self.thumbnails, cache, photo, pixels, dense);
+                    let image = zoom_image(
+                        &mut self.tiles,
+                        &self.thumbnails,
+                        cache,
+                        photo,
+                        pixels,
+                        dense,
+                    );
                     // Margined photos need their thumbnails, decoded, as they
                     // come into the zoom.
                     if margined {
@@ -3322,7 +3476,6 @@ impl PhotosApp {
         )
         .absolute()
         .size_0();
-        let title_opacity: f32 = title_opacity.min(1.);
         div()
             .id("gallery-motion")
             .debug_selector(|| "gallery-motion".into())
@@ -3332,36 +3485,6 @@ impl PhotosApp {
             .bg(rgb(c.bg))
             .child(prepare)
             .children(children)
-            .when(title_opacity > 0.002, |d| {
-                d.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .w_full()
-                        .h(px(84.))
-                        .overflow_hidden()
-                        .bg(rgb(c.bg))
-                        .px_5()
-                        .pt_4()
-                        .when(title_opacity < 1., |d| d.opacity(title_opacity))
-                        .child(
-                            div()
-                                .text_size(px(28.))
-                                .font_weight(FontWeight::BOLD)
-                                .child(self.title()),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(rgb(c.muted))
-                                .child(format!(
-                                    "{} photos",
-                                    self.total.unwrap_or(self.library.photos.len())
-                                )),
-                        ),
-                )
-            })
             .into_any_element()
     }
     /// A photo's width / height: from its decoded thumbnail (which is already
@@ -3408,6 +3531,11 @@ impl PhotosApp {
                             .get(photo, class)
                             .filter(|_| landing.as_ref() != Some(&photo.id));
                         let selected = any_selected && this.selected.contains(&photo.id);
+                        // Video lengths, where the square has room for them.
+                        let length = photo
+                            .duration
+                            .filter(|s| *s > 0. && cell.edge >= 44.)
+                            .map(duration_label);
                         tiles.push((
                             Bounds::new(
                                 bounds.origin + point(px(cell.x), px(cell.y - top)),
@@ -3415,6 +3543,7 @@ impl PhotosApp {
                             ),
                             image,
                             selected,
+                            length,
                         ));
                     }
                     let ahead = viewport * 1.5;
@@ -3429,13 +3558,13 @@ impl PhotosApp {
                     tiles
                 })
             },
-            move |bounds, tiles, w, _| {
+            move |bounds, tiles, w, cx| {
                 let corners = Corners::all(px(radius));
                 // One layer shares one draw order: tiles never overlap, and this
                 // skips GPUI's per-primitive overlap search (the dominant cost
                 // with thousands of tiles) and lets every sprite batch together.
                 w.paint_layer(bounds, |w| {
-                    for (bounds, image, _) in &tiles {
+                    for (bounds, image, _, _) in &tiles {
                         match image {
                             Some(image) => {
                                 let _ = w.paint_image(*bounds, corners, image.clone(), 0, false);
@@ -3448,7 +3577,7 @@ impl PhotosApp {
                 });
                 // Outlines go in a later layer, above the images.
                 w.paint_layer(bounds, |w| {
-                    for (bounds, _, selected) in &tiles {
+                    for (bounds, _, selected, _) in &tiles {
                         if *selected {
                             w.paint_quad(quad(
                                 *bounds,
@@ -3461,6 +3590,42 @@ impl PhotosApp {
                         }
                     }
                 });
+                // Video lengths sit in the bottom-right corner, as on the
+                // margined tiles.
+                let font = w.text_style().font();
+                for (tile, _, _, length) in &tiles {
+                    let Some(length) = length else {
+                        continue;
+                    };
+                    let edge = f32::from(tile.size.width);
+                    let text = (edge * 0.11).clamp(9., 12.);
+                    let run = TextRun {
+                        len: length.len(),
+                        font: Font {
+                            weight: FontWeight::MEDIUM,
+                            ..font.clone()
+                        },
+                        color: rgb(0xffffff).into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let line = w.text_system().shape_line(
+                        SharedString::from(length.clone()),
+                        px(text),
+                        &[run],
+                        None,
+                    );
+                    let (pad_x, height) = (text * 0.45, text * 1.4);
+                    let inset = (edge * 0.05).max(3.);
+                    let width = f32::from(line.width) + pad_x * 2.;
+                    let badge = Bounds::new(
+                        tile.origin + point(px(edge - inset - width), px(edge - inset - height)),
+                        size(px(width), px(height)),
+                    );
+                    w.paint_quad(fill(badge, rgba(0x0000008c)).corner_radii(px(height / 2.)));
+                    let _ = line.paint(badge.origin + point(px(pad_x), px(0.)), px(height), w, cx);
+                }
             },
         )
         .absolute()
@@ -3640,45 +3805,6 @@ impl PhotosApp {
             .flex()
             .flex_col()
             .overflow_hidden();
-        if !layout.full_bleed() {
-            let count = if self.filter == Filter::All && self.search.read(cx).value().is_empty() {
-                self.total.unwrap_or(photos.len())
-            } else {
-                photos.len()
-            };
-            let subtitle = if self.has_more {
-                format!("{count} photos · cataloging {}", self.library.photos.len())
-            } else {
-                format!("{count} photos")
-            };
-            content = content.child(
-                div()
-                    .h(px(84.))
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .flex_shrink_0()
-                    .px_5()
-                    .pt_4()
-                    .pb_3()
-                    .child(
-                        div()
-                            .w(px((available - 40.).max(1.)))
-                            .text_size(px(28.))
-                            .font_weight(FontWeight::BOLD)
-                            .truncate()
-                            .child(self.title()),
-                    )
-                    .child(
-                        div()
-                            .w(px((available - 40.).max(1.)))
-                            .truncate()
-                            .text_size(px(12.))
-                            .text_color(rgb(c.muted))
-                            .child(subtitle),
-                    ),
-            );
-        }
         if photos.is_empty() {
             content = content.child(kit::empty(
                 "photos",
@@ -4385,38 +4511,61 @@ impl PhotosApp {
                                         ))),
                                 )
                             })
-                            .when(photo.duration.is_some() && video.is_none(), |d| {
-                                d.child(
-                                    div()
-                                        .absolute()
-                                        .inset_0()
-                                        .flex()
-                                        .flex_col()
-                                        .items_center()
-                                        .justify_center()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .size(px(56.))
-                                                .rounded_full()
-                                                .bg(rgba(0x15181dbb))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .child(kit::glyph("play", 24., 0xffffff)),
-                                        )
-                                        .child(
-                                            div()
-                                                .px_2()
-                                                .py_1()
-                                                .rounded(px(6.))
-                                                .bg(rgba(0x15181dbb))
-                                                .text_size(px(11.))
-                                                .text_color(rgb(0xffffff))
-                                                .child("Play this video in its library's own app"),
-                                        ),
-                                )
-                            });
+                            // Where the native player cannot play it (other
+                            // platforms), a video opens in the system's player.
+                            .when(
+                                photo.duration.is_some()
+                                    && (video.is_none() || !cfg!(target_os = "macos")),
+                                |d| {
+                                    let external = photo.clone();
+                                    d.child(
+                                        div()
+                                            .absolute()
+                                            .inset_0()
+                                            .flex()
+                                            .flex_col()
+                                            .items_center()
+                                            .justify_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .id("play-external")
+                                                    .debug_selector(|| "play-external".into())
+                                                    .size(px(56.))
+                                                    .rounded_full()
+                                                    .bg(rgba(0x15181dbb))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.bg(rgba(0x15181dee)))
+                                                    .child(kit::glyph("play", 24., 0xffffff))
+                                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                        cx.stop_propagation()
+                                                    })
+                                                    .on_click(cx.listener(
+                                                        move |this, _, w, cx| {
+                                                            this.play_externally(
+                                                                external.clone(),
+                                                                w,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py_1()
+                                                    .rounded(px(6.))
+                                                    .bg(rgba(0x15181dbb))
+                                                    .text_size(px(11.))
+                                                    .text_color(rgb(0xffffff))
+                                                    .child("Play in your video player"),
+                                            ),
+                                    )
+                                },
+                            );
                         match opening {
                             Some((epoch, from)) => {
                                 let to = Bounds::new(
@@ -4758,88 +4907,6 @@ impl PhotosApp {
                 .is_some_and(|until| std::time::Instant::now() < until);
         shown.then(|| self.notice.clone())
     }
-    fn inspector_view(&self, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut info = div()
-            .id("photo-inspector")
-            .debug_selector(|| "photo-inspector".into())
-            .w(px(250.))
-            .h_full()
-            .flex_shrink_0()
-            .border_l_1()
-            .border_color(rgb(c.border))
-            .bg(rgb(c.surface))
-            .flex()
-            .flex_col()
-            .child(kit::panel_heading("Photo info", "", c));
-        if let Some(photo) = self.current() {
-            info = info.child(
-                div()
-                    .id("inspector-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .p_4()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(photo.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(rgb(c.muted))
-                            .child(format!(
-                                "{} × {} pixels\n{:.2} MB\nModified {}",
-                                photo.width,
-                                photo.height,
-                                photo.bytes as f64 / 1_000_000.,
-                                photo.modified.format("%b %-d, %Y, %-I:%M %p")
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(c.muted))
-                            .child(photo.id),
-                    )
-                    .child(Input::new(&self.caption).h(px(100.)))
-                    .child(
-                        ui::button("save-caption", c, false, true)
-                            .child("Save caption")
-                            .on_click(cx.listener(|this, _, w, cx| {
-                                if let Some(photo) = this.current() {
-                                    let caption = this.caption.read(cx).value().to_string();
-                                    this.job(
-                                        w,
-                                        cx,
-                                        move |driver| driver.caption(&photo.id, &caption),
-                                        |this, _| this.notice = "Caption saved".into(),
-                                    );
-                                }
-                            })),
-                    )
-                    .when(!photo.path.as_os_str().is_empty(), |d| {
-                        d.child(
-                            ui::button("reveal-photo", c, false, true)
-                                .child("Show in folder")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(photo) = this.current()
-                                        && !photo.path.as_os_str().is_empty()
-                                    {
-                                        cx.reveal_path(&photo.path);
-                                    }
-                                })),
-                        )
-                    }),
-            );
-        } else {
-            info = info.child(kit::empty("info", "Select a photo", "", c));
-        }
-        info
-    }
     fn source_choices(&self, w: &Window, c: Colors, cx: &mut Context<Self>) -> Div {
         let mut content = div().flex().flex_col().gap_3();
         if let Some(provider) = self.provider_step {
@@ -5065,7 +5132,7 @@ impl PhotosApp {
             Modal::Browse => "Library & albums",
             Modal::Album => "New album",
             Modal::AddToAlbum => "Add to album",
-            Modal::Help => "Photos Help",
+            Modal::Help => "Tonto Help",
             Modal::DeleteConfirm => "Delete photos",
         };
         let mut content = div()
@@ -5081,110 +5148,9 @@ impl PhotosApp {
                 if self.settings_page == 0 {
                     content = content.child(self.source_choices(w, c, cx));
                 } else if self.settings_page == 1 {
-                    content = content.child(kit::panel_heading(
-                        "Appearance",
-                        "Choose how Photos looks on this device.",
-                        c,
-                    ));
-                    for (key, label) in [("system", "System"), ("light", "Light"), ("dark", "Dark")]
-                    {
-                        content = content.child(
-                            ui::button(
-                                SharedString::from(format!("appearance-{key}")),
-                                c,
-                                self.preferences.appearance == key,
-                                false,
-                            )
-                            .child(label)
-                            .on_click(cx.listener(
-                                move |this, _, w, cx| {
-                                    this.preferences.appearance = key.into();
-                                    if let Err(e) = this.preferences.save(&this.config_path) {
-                                        this.error = Some(e.to_string());
-                                    }
-                                    this.theme(w, cx);
-                                },
-                            )),
-                        );
-                    }
-                    content = content
-                        .child(
-                            div()
-                                .mt_3()
-                                .text_size(px(13.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child("Accent color"),
-                        )
-                        .child(div().flex().flex_wrap().gap_3().children(Accent::ALL.map(
-                            |accent| {
-                                let color = Colors::new(
-                                    matches!(self.preferences.appearance.as_str(), "dark")
-                                        || self.preferences.appearance != "light"
-                                            && ui::system_dark(w),
-                                    accent,
-                                );
-                                let active = self.accent() == accent;
-                                let id = format!("accent-{}", accent.key());
-                                div()
-                                    .id(SharedString::from(id.clone()))
-                                    .debug_selector(move || id)
-                                    .size(px(32.))
-                                    .rounded_full()
-                                    .p(px(3.))
-                                    .border_2()
-                                    .border_color(rgb(if active {
-                                        color.accent
-                                    } else {
-                                        c.surface
-                                    }))
-                                    .cursor_pointer()
-                                    .focusable()
-                                    .tab_index(0)
-                                    .child(
-                                        div()
-                                            .size_full()
-                                            .rounded_full()
-                                            .bg(rgb(color.accent))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .when(active, |d| {
-                                                d.child(kit::glyph("check", 12., color.on_accent))
-                                            }),
-                                    )
-                                    .on_click(cx.listener(move |this, _, w, cx| {
-                                        this.set_accent(accent, w, cx)
-                                    }))
-                                    .on_key_down(cx.listener(
-                                        move |this, event: &KeyDownEvent, w, cx| {
-                                            if matches!(
-                                                event.keystroke.key.as_str(),
-                                                "enter" | "space"
-                                            ) {
-                                                cx.stop_propagation();
-                                                this.set_accent(accent, w, cx);
-                                            }
-                                        },
-                                    ))
-                            },
-                        )))
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(rgb(c.muted))
-                                .child(format!(
-                                    "{} · buttons, selection and highlights",
-                                    self.accent().label()
-                                )),
-                        );
+                    content = content.child(self.appearance_page(w, c, cx));
                 } else {
-                    content = content.child(kit::panel_heading("Behavior", "Choose how you browse your library.",c))
-                        .child(div().flex().items_center().gap_4()
-                            .child(div().flex_1().child(div().text_size(px(14.)).child("Browse from bottom to top"))
-                                .child(div().mt_1().text_size(px(12.)).text_color(rgb(c.muted)).child("Start at the newest photos at the bottom. Scroll up to go back in time.")))
-                            .child(div().id("bottom-to-top-setting").debug_selector(|| "bottom-to-top-setting".into()).child(Switch::new("bottom-to-top")
-                                .checked(self.preferences.bottom_to_top)
-                                .on_click(cx.listener(|this,value: &bool,_,cx| this.set_scroll_direction(*value,cx))))));
+                    content = content.child(self.behavior_page(c, cx));
                 }
             }
             Modal::DeleteConfirm => {
@@ -5527,6 +5493,9 @@ impl Render for PhotosApp {
         let width: f32 = w.viewport_size().width.into();
         let show_sidebar = self.sidebar && width >= 960.;
         let show_info = self.inspector && width >= 900.;
+        if std::mem::take(&mut self.sizes_dirty) {
+            self.apply_sizes(w, cx);
+        }
         let guard_entity = cx.weak_entity();
         let mut root = div()
             .id("photos-app")
@@ -5682,12 +5651,7 @@ impl Render for PhotosApp {
                     }),
                 ),
             )
-            .child(
-                div()
-                    .ml_2()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .when(width >= 480., |d| d.child("Photos")),
-            )
+            .child(ui::app_brand("brand/tonto.svg", "Tonto", width >= 480.))
             .child(div().flex_1());
         if let Some((label, progress)) = self.loading_status() {
             bar = bar.child(progress::indicator(label, progress, width >= 700., c));
@@ -5722,7 +5686,7 @@ impl Render for PhotosApp {
         bar =
             bar.child(ui::toolbar_separator(c))
                 .when(width >= 520., |d| {
-                    d.child(kit::tool("help", "info", "Photos Help", c).on_click(
+                    d.child(kit::tool("help", "info", "Tonto Help", c).on_click(
                         cx.listener(|this, _, w, cx| this.open_modal(Modal::Help, w, cx)),
                     ))
                 })
@@ -5773,9 +5737,9 @@ impl Render for PhotosApp {
                             .child(self.source_choices(w, c, cx))
                             .into_any_element()
                     } else {
-                        kit::welcome(
-                            "photos",
-                            "Your photos, together",
+                        kit::welcome_brand(
+                            "brand/tonto.svg",
+                            "Welcome to Tonto",
                             "Choose a library to get started.",
                             c,
                         )
@@ -5784,8 +5748,9 @@ impl Render for PhotosApp {
                     }),
             );
         } else {
-            let available =
-                width - if show_sidebar { 216. } else { 0. } - if show_info { 250. } else { 0. };
+            let available = width
+                - if show_sidebar { 216. } else { 0. }
+                - if show_info { info::INSPECTOR_WIDTH } else { 0. };
             let mut main = div()
                 .flex_1()
                 .min_h_0()
@@ -5829,25 +5794,25 @@ impl Render for PhotosApp {
                             .child(
                                 kit::tool("show-info", "info", "Photo details", c)
                                     .when(self.inspector, |d| d.bg(rgb(c.soft)))
-                                    .on_click(cx.listener(move |this, _, w, cx| {
+                                    .on_click(cx.listener(move |this, _, _, cx| {
                                         if width < 900. {
                                             this.notice =
                                                 "Photo details require a wider window.".into();
                                         } else {
                                             this.inspector = !this.inspector;
-                                            if let Some(photo) = this.current() {
-                                                this.caption.update(cx, |e, cx| {
-                                                    e.set_value(photo.caption, w, cx)
-                                                });
-                                            }
                                         }
                                         cx.notify();
                                     })),
                             ),
                     )
                 });
+            if self.viewer.is_none() && self.driver.is_some() {
+                main = main.child(self.view_header(c, cx));
+            }
             main = main.child(if self.viewer.is_some() {
                 self.viewer_view(w, c, cx).into_any_element()
+            } else if self.filter == Filter::Explore {
+                self.explore_view(c, cx)
             } else {
                 self.grid_view(available, c, cx).into_any_element()
             });
@@ -5886,15 +5851,17 @@ impl Render for PhotosApp {
                                 .gap_3()
                                 .child(div().truncate().min_w_0().child(photo.name))
                                 .child(div().w(px(1.)).h(px(14.)).flex_shrink_0().bg(rgb(c.border)))
-                                .child(div().flex_shrink_0().child(match photo.duration {
-                                    Some(seconds) => format!(
-                                        "{} × {} · {}",
-                                        photo.width,
-                                        photo.height,
-                                        duration_label(seconds)
-                                    ),
-                                    None => format!("{} × {}", photo.width, photo.height),
-                                })),
+                                .child(div().flex_shrink_0().child(
+                                    match photo.duration.filter(|s| *s > 0.) {
+                                        Some(seconds) => format!(
+                                            "{} × {} · {}",
+                                            photo.width,
+                                            photo.height,
+                                            duration_label(seconds)
+                                        ),
+                                        None => format!("{} × {}", photo.width, photo.height),
+                                    },
+                                )),
                         )
                         .child(self.selection_actions(true, c, cx)),
                 );
@@ -5978,6 +5945,7 @@ impl Render for PhotosApp {
                         ),
                 );
             }
+            let inspector = show_info.then(|| self.inspector_view(w, c, cx));
             root = root.child(
                 div()
                     .flex_1()
@@ -5986,7 +5954,7 @@ impl Render for PhotosApp {
                     .flex()
                     .when(show_sidebar, |d| d.child(self.sidebar_view(c, cx)))
                     .child(main)
-                    .when(show_info, |d| d.child(self.inspector_view(c, cx))),
+                    .children(inspector),
             );
         }
         if let Some(m) = &self.marquee {
@@ -6109,14 +6077,14 @@ pub fn run() -> anyhow::Result<()> {
             register_shortcuts(cx);
             cx.set_menus(vec![
                 Menu {
-                    name: "Photos".into(),
+                    name: "Tonto".into(),
                     items: vec![
                         MenuItem::action("Settings…", Settings),
                         MenuItem::separator(),
-                        MenuItem::action("Hide Photos", Hide),
+                        MenuItem::action("Hide Tonto", Hide),
                         MenuItem::action("Hide Others", HideOthers),
                         MenuItem::separator(),
-                        MenuItem::action("Quit Photos", Quit),
+                        MenuItem::action("Quit Tonto", Quit),
                     ],
                 },
                 Menu {
@@ -6149,7 +6117,7 @@ pub fn run() -> anyhow::Result<()> {
                     ))),
                     window_min_size: Some(size(px(360.), px(360.))),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("Photos".into()),
+                        title: Some("Tonto".into()),
                         appears_transparent: cfg!(target_os = "macos"),
                         ..Default::default()
                     }),
@@ -6162,7 +6130,7 @@ pub fn run() -> anyhow::Result<()> {
                     cx.new(|cx| Root::new(view, w, cx))
                 },
             )
-            .expect("Cannot open the Photos window");
+            .expect("Cannot open the Tonto window");
             cx.on_window_closed(|cx| {
                 if cx.windows().is_empty() {
                     cx.quit();

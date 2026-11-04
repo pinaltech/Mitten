@@ -1,6 +1,7 @@
 //! Paged, read-only provider access. Edits are private Photos annotations.
 use crate::storage::{
-    ImportReport, Library, LocalPhotos, Photo, PhotosDriver, Source, VideoSource,
+    ImportReport, Library, LocalPhotos, Person, Photo, PhotoDetails, PhotosDriver, Place, Query,
+    Source, VideoSource,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -232,6 +233,90 @@ pub trait Provider: Send + Sync {
     fn video(&self, _photo: &Photo) -> Option<VideoSource> {
         None
     }
+    /// The image at most `edge` px on its long side (the source may return
+    /// a larger one; it is scaled down after).
+    fn image_at(&self, photo: &Photo, edge: u32, destination: &Path) -> Result<()> {
+        self.image(photo, edge > 512, destination)
+    }
+    fn details(&self, _photo: &Photo) -> Result<PhotoDetails> {
+        Ok(PhotoDetails::default())
+    }
+    fn explore(&self) -> bool {
+        false
+    }
+    fn people(&self) -> Result<Vec<Person>> {
+        Ok(vec![])
+    }
+    fn person_thumbnail(&self, _id: &str, _destination: &Path) -> Result<()> {
+        bail!("This source has no people")
+    }
+    fn places(&self) -> Result<Vec<Place>> {
+        Ok(vec![])
+    }
+    fn matching(&self, _query: &Query) -> Result<Vec<String>> {
+        Ok(vec![])
+    }
+    fn search(&self, _text: &str) -> Result<Option<Vec<String>>> {
+        Ok(None)
+    }
+    /// Whether favorites, descriptions and albums are written back to the
+    /// source (two-way) rather than kept as private annotations.
+    fn writable(&self) -> bool {
+        false
+    }
+    fn set_favorite(&self, _ids: &[String], _value: bool) -> Result<()> {
+        bail!("This source is read-only")
+    }
+    fn set_description(&self, _id: &str, _description: &str) -> Result<()> {
+        bail!("This source is read-only")
+    }
+    fn create_album(&self, _name: &str) -> Result<()> {
+        bail!("This source is read-only")
+    }
+    fn add_to_album(&self, _name: &str, _ids: &[String]) -> Result<()> {
+        bail!("This source is read-only")
+    }
+    fn remove_from_album(&self, _name: &str, _ids: &[String]) -> Result<()> {
+        bail!("This source is read-only")
+    }
+}
+/// Edits written to a two-way source this session, shown until the next
+/// full catalog reload brings them back from the source itself.
+#[derive(Default)]
+struct Written {
+    favorites: std::collections::HashMap<String, bool>,
+    captions: std::collections::HashMap<String, String>,
+}
+/// Rejects HTML error pages and enforces decode bounds before GPUI sees
+/// data, then rewrites `path` as an upright JPEG at most `edge` px.
+fn normalize(path: &Path, edge: u32) -> Result<()> {
+    let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    reader.limits(limits);
+    let jpeg = reader.format() == Some(image::ImageFormat::Jpeg);
+    let mut decoder = reader.into_decoder()?;
+    let orientation = image::ImageDecoder::orientation(&mut decoder)?;
+    let mut image = image::DynamicImage::from_decoder(decoder)?;
+    // A valid JPEG that is already upright and small enough (what PhotoKit
+    // delivers) is kept as is rather than re-encoded.
+    let keep = jpeg
+        && orientation == image::metadata::Orientation::NoTransforms
+        && image.width() <= edge
+        && image.height() <= edge;
+    if !keep {
+        image.apply_orientation(orientation);
+        let image = if image.width() <= edge && image.height() <= edge {
+            image.to_rgb8()
+        } else {
+            image.thumbnail(edge, edge).to_rgb8()
+        };
+        image::codecs::jpeg::JpegEncoder::new_with_quality(fs::File::create(path)?, 88)
+            .encode_image(&image)?;
+    }
+    Ok(())
 }
 pub struct ConnectedPhotos {
     source: Source,
@@ -239,6 +324,7 @@ pub struct ConnectedPhotos {
     annotations: LocalPhotos,
     /// Provider albums, fetched with each catalog's first page.
     synced: Mutex<BTreeMap<String, BTreeSet<String>>>,
+    written: Mutex<Written>,
 }
 impl ConnectedPhotos {
     pub fn new(source: Source, provider: Box<dyn Provider>) -> Result<Self> {
@@ -249,17 +335,48 @@ impl ConnectedPhotos {
             provider,
             annotations,
             synced: Mutex::default(),
+            written: Mutex::default(),
         })
     }
+    /// Sends favorites and descriptions made while this source was still
+    /// annotated privately to the source, once, then forgets them locally.
+    /// Local removals of a source favorite are dropped (the source wins).
+    fn migrate_annotations(&self) {
+        let Ok(meta) = self.annotations.metadata() else {
+            return;
+        };
+        if meta.favorites.is_empty() && meta.unfavorites.is_empty() && meta.captions.is_empty() {
+            return;
+        }
+        let favorites: Vec<String> = meta.favorites.iter().cloned().collect();
+        let pushed = favorites.is_empty() || self.provider.set_favorite(&favorites, true).is_ok();
+        // Descriptions the source refused stay local.
+        let kept: BTreeMap<String, String> = meta
+            .captions
+            .iter()
+            .filter(|(id, caption)| self.provider.set_description(id, caption).is_err())
+            .map(|(id, caption)| (id.clone(), caption.clone()))
+            .collect();
+        let _ = self.annotations.mutate(|m| {
+            if pushed {
+                m.favorites.clear();
+            }
+            m.unfavorites.clear();
+            m.captions = kept;
+            Ok(())
+        });
+    }
     fn image(&self, photo: &Photo, preview: bool) -> Result<PathBuf> {
-        let kind = if preview { "preview" } else { "thumb" };
+        let sizes = crate::loading::image_sizes();
+        let edge = if preview { sizes.viewer } else { sizes.grid };
+        let kind = crate::loading::sized_kind(if preview { "preview" } else { "thumb" }, edge);
         let directory = self.source.path.join(".desert-photos/cache");
         let path = directory.join(format!("{}-{kind}.jpg", digest(&photo.fingerprint)));
         if path.is_file() {
             return Ok(path);
         }
         let temp = tempfile::NamedTempFile::new_in(&directory)?;
-        self.provider.image(photo, preview, temp.path())?;
+        self.provider.image_at(photo, edge, temp.path())?;
         // A provider's preview of a moving photo is usually the animated file
         // itself: keep its motion before the still JPEG replaces it.
         if preview && crate::storage::may_move(&photo.name) {
@@ -273,34 +390,7 @@ impl ConnectedPhotos {
                 );
             }
         }
-        // Reject HTML error pages and enforce decode bounds before GPUI sees data.
-        let mut reader = image::ImageReader::open(temp.path())?.with_guessed_format()?;
-        let mut limits = image::Limits::default();
-        limits.max_alloc = Some(128 * 1024 * 1024);
-        limits.max_image_width = Some(8192);
-        limits.max_image_height = Some(8192);
-        reader.limits(limits);
-        let jpeg = reader.format() == Some(image::ImageFormat::Jpeg);
-        let mut decoder = reader.into_decoder()?;
-        let orientation = image::ImageDecoder::orientation(&mut decoder)?;
-        let mut image = image::DynamicImage::from_decoder(decoder)?;
-        let edge = if preview { 2560 } else { 512 };
-        // A valid JPEG that is already upright and small enough (what PhotoKit
-        // delivers) is kept as is rather than re-encoded.
-        let keep = jpeg
-            && orientation == image::metadata::Orientation::NoTransforms
-            && image.width() <= edge
-            && image.height() <= edge;
-        if !keep {
-            image.apply_orientation(orientation);
-            let image = if image.width() <= edge && image.height() <= edge {
-                image.to_rgb8()
-            } else {
-                image.thumbnail(edge, edge).to_rgb8()
-            };
-            image::codecs::jpeg::JpegEncoder::new_with_quality(fs::File::create(temp.path())?, 88)
-                .encode_image(&image)?;
-        }
+        normalize(temp.path(), edge)?;
         // Cache files are renamed into place atomically; no per-file flush.
         match temp.persist_noclobber(&path) {
             Ok(_) => (),
@@ -311,24 +401,37 @@ impl ConnectedPhotos {
     }
     fn annotate(&self, library: &mut Library) -> Result<()> {
         let meta = self.annotations.metadata()?;
+        let writable = self.provider.writable();
         library.albums = meta.albums;
         library.synced.clear();
         // Provider albums merge with same-named local ones; those stay
-        // editable, and only purely provider albums are read-only.
+        // editable, and only purely provider albums of read-only sources
+        // are read-only.
         for (name, ids) in self.synced.lock().unwrap().iter() {
             match library.albums.get_mut(name) {
                 Some(local) => local.extend(ids.iter().cloned()),
                 None => {
                     library.albums.insert(name.clone(), ids.clone());
-                    library.synced.insert(name.clone());
+                    if !writable {
+                        library.synced.insert(name.clone());
+                    }
                 }
             }
         }
+        let written = self.written.lock().unwrap();
         for photo in &mut library.photos {
-            let favorite = (photo.favorite || meta.favorites.contains(&photo.id))
-                && !meta.unfavorites.contains(&photo.id);
+            let favorite = match written.favorites.get(&photo.id) {
+                Some(&value) => value,
+                None => {
+                    (photo.favorite || meta.favorites.contains(&photo.id))
+                        && !meta.unfavorites.contains(&photo.id)
+                }
+            };
             let deleted = meta.deleted.contains(&photo.id);
-            let caption = meta.captions.get(&photo.id);
+            let caption = written
+                .captions
+                .get(&photo.id)
+                .or_else(|| meta.captions.get(&photo.id));
             if favorite != photo.favorite
                 || deleted != photo.deleted
                 || caption.is_some_and(|c| c != &photo.caption)
@@ -355,6 +458,11 @@ impl PhotosDriver for ConnectedPhotos {
         false
     }
     fn page(&self, cursor: Option<&str>) -> Result<PhotoPage> {
+        if cursor.is_none() && self.provider.writable() {
+            // A full reload reads every edit back from the source.
+            self.migrate_annotations();
+            *self.written.lock().unwrap() = Written::default();
+        }
         let mut page = self.provider.page(cursor)?;
         if cursor.is_none() {
             // Album sync never blocks the catalog: a failure keeps the last set.
@@ -402,6 +510,72 @@ impl PhotosDriver for ConnectedPhotos {
     fn video(&self, photo: &Photo) -> Option<VideoSource> {
         self.provider.video(photo)
     }
+    fn sample(&self, photo: &Photo, edge: u32) -> Result<()> {
+        let temp = tempfile::NamedTempFile::new()?;
+        self.provider.image_at(photo, edge, temp.path())?;
+        normalize(temp.path(), edge)
+    }
+    fn details(&self, photo: &Photo) -> Result<PhotoDetails> {
+        self.provider.details(photo)
+    }
+    /// Remote videos are downloaded once into the cache for players that
+    /// cannot stream with the server's credentials.
+    fn video_file(&self, photo: &Photo) -> Result<PathBuf> {
+        if let Some(VideoSource::File(path)) = self.provider.video(photo) {
+            return Ok(path);
+        }
+        ensure!(photo.duration.is_some(), "This is not a video");
+        let directory = self.source.path.join(".desert-photos/cache");
+        let extension = Path::new(&photo.name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .filter(|e| e.chars().all(|c| c.is_ascii_alphanumeric()))
+            .unwrap_or("mp4")
+            .to_ascii_lowercase();
+        let path = directory.join(format!("{}-video.{extension}", digest(&photo.fingerprint)));
+        if path.is_file() {
+            return Ok(path);
+        }
+        let temp = tempfile::NamedTempFile::new_in(&directory)?;
+        self.provider.original(&photo.id, temp.path())?;
+        match temp.persist_noclobber(&path) {
+            Ok(_) => (),
+            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(e) => return Err(e.error.into()),
+        }
+        Ok(path)
+    }
+    fn explore(&self) -> bool {
+        self.provider.explore()
+    }
+    fn people(&self) -> Result<Vec<Person>> {
+        self.provider.people()
+    }
+    fn person_thumbnail(&self, id: &str) -> Result<PathBuf> {
+        let directory = self.source.path.join(".desert-photos/cache");
+        let path = directory.join(format!("{}-person.jpg", digest(id)));
+        if path.is_file() {
+            return Ok(path);
+        }
+        let temp = tempfile::NamedTempFile::new_in(&directory)?;
+        self.provider.person_thumbnail(id, temp.path())?;
+        normalize(temp.path(), 256)?;
+        match temp.persist_noclobber(&path) {
+            Ok(_) => (),
+            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(e) => return Err(e.error.into()),
+        }
+        Ok(path)
+    }
+    fn places(&self) -> Result<Vec<Place>> {
+        self.provider.places()
+    }
+    fn matching(&self, query: &Query) -> Result<Vec<String>> {
+        self.provider.matching(query)
+    }
+    fn search(&self, text: &str) -> Result<Option<Vec<String>>> {
+        self.provider.search(text)
+    }
     fn motion(&self, photo: &Photo, large: bool) -> Result<Option<PathBuf>> {
         if !crate::storage::may_move(&photo.name) {
             return Ok(None);
@@ -422,6 +596,14 @@ impl PhotosDriver for ConnectedPhotos {
         bail!("Import photos through this provider's own app, or choose a local folder")
     }
     fn favorite(&self, ids: &[String], value: bool) -> Result<()> {
+        if self.provider.writable() {
+            self.provider.set_favorite(ids, value)?;
+            let mut written = self.written.lock().unwrap();
+            for id in ids {
+                written.favorites.insert(id.clone(), value);
+            }
+            return Ok(());
+        }
         self.annotations.mutate(|m| {
             for id in ids {
                 if value {
@@ -448,15 +630,41 @@ impl PhotosDriver for ConnectedPhotos {
         })
     }
     fn caption(&self, id: &str, caption: &str) -> Result<()> {
+        if self.provider.writable() {
+            self.provider.set_description(id, caption)?;
+            self.written
+                .lock()
+                .unwrap()
+                .captions
+                .insert(id.to_owned(), caption.to_owned());
+            return Ok(());
+        }
         self.annotations.mutate(|m| {
             m.captions.insert(id.to_owned(), caption.to_owned());
             Ok(())
         })
     }
     fn create_album(&self, name: &str) -> Result<()> {
+        if self.provider.writable() {
+            let name = crate::storage::album_name(name)?;
+            ensure!(
+                !self.synced.lock().unwrap().contains_key(&name),
+                "An album named “{name}” already exists"
+            );
+            self.provider.create_album(&name)?;
+            self.synced.lock().unwrap().insert(name, BTreeSet::new());
+            return Ok(());
+        }
         self.annotations.create_album(name)
     }
     fn add_to_album(&self, name: &str, ids: &[String]) -> Result<()> {
+        if self.provider.writable() && self.synced.lock().unwrap().contains_key(name) {
+            self.provider.add_to_album(name, ids)?;
+            if let Some(album) = self.synced.lock().unwrap().get_mut(name) {
+                album.extend(ids.iter().cloned());
+            }
+            return Ok(());
+        }
         self.annotations.mutate(|m| {
             let Some(album) = m.albums.get_mut(name) else {
                 ensure!(
@@ -470,6 +678,17 @@ impl PhotosDriver for ConnectedPhotos {
         })
     }
     fn remove_from_album(&self, name: &str, ids: &[String]) -> Result<()> {
+        if self.provider.writable() && self.synced.lock().unwrap().contains_key(name) {
+            self.provider.remove_from_album(name, ids)?;
+            if let Some(album) = self.synced.lock().unwrap().get_mut(name) {
+                for id in ids {
+                    album.remove(id);
+                }
+            }
+            // A same-named local album may hold some of them too.
+            let _ = self.annotations.remove_from_album(name, ids);
+            return Ok(());
+        }
         if let Some(synced) = self.synced.lock().unwrap().get(name) {
             ensure!(
                 !ids.iter().any(|id| synced.contains(id)),

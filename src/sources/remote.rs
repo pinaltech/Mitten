@@ -48,6 +48,8 @@ pub struct Remote {
     http: Client,
     secret: String,
     dav: reqwest_dav::Client,
+    /// Immich album IDs by the names shown in the sidebar.
+    album_ids: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 impl Remote {
     pub fn new(config: Connection, secret: &str) -> Result<Self> {
@@ -79,6 +81,7 @@ impl Remote {
             http,
             secret: secret.to_owned(),
             dav,
+            album_ids: Default::default(),
         })
     }
     fn immich_request(&self, method: Method, url: Url) -> reqwest::blocking::RequestBuilder {
@@ -87,7 +90,9 @@ impl Remote {
             .header("x-api-key", &self.secret)
     }
     fn immich_page(&self, cursor: Option<&str>) -> Result<PhotoPage> {
-        let mut body = json!({"size": PAGE_SIZE, "type": "IMAGE", "withExif": true, "order": "desc", "isTrashed": false});
+        // Photos and videos together (no type filter), newest first.
+        let mut body =
+            json!({"size": PAGE_SIZE, "withExif": true, "order": "desc", "isTrashed": false});
         match cursor {
             Some(c) if c.starts_with("cursor:") => body["cursor"] = json!(&c[7..]),
             Some(c) => body["page"] = json!(c.parse::<usize>().context("Invalid Immich page")?),
@@ -107,7 +112,11 @@ impl Remote {
         ensure!(items.len() <= PAGE_SIZE, "Immich ignored the page limit");
         let mut photos = Vec::with_capacity(items.len());
         for a in items {
-            if a["type"].as_str().is_some_and(|t| t != "IMAGE") {
+            let video = a["type"].as_str() == Some("VIDEO");
+            if a["type"]
+                .as_str()
+                .is_some_and(|t| t != "IMAGE" && t != "VIDEO")
+            {
                 continue;
             }
             let id = a["id"]
@@ -118,7 +127,7 @@ impl Remote {
             let modified = date(a["fileCreatedAt"].as_str().or(a["createdAt"].as_str()));
             photos.push(Arc::new(Photo {
                 fingerprint: digest(&format!("{id}:{}:{}", a["updatedAt"], a["checksum"])),
-                duration: None,
+                duration: video.then(|| a["duration"].as_str().map_or(0., clock_seconds)),
                 id,
                 path: PathBuf::new(),
                 name: a["originalFileName"].as_str().unwrap_or("Photo").into(),
@@ -163,6 +172,78 @@ impl Remote {
             next,
             total,
         })
+    }
+    /// A write, explaining the API key permission it needs when refused.
+    fn immich_write(
+        &self,
+        method: Method,
+        path: &str,
+        body: Value,
+        permission: &str,
+    ) -> Result<()> {
+        let response = self
+            .immich_request(method, self.base.join(path)?)
+            .json(&body)
+            .send()?;
+        ensure!(
+            response.status() != reqwest::StatusCode::FORBIDDEN
+                && response.status() != reqwest::StatusCode::UNAUTHORIZED,
+            "Immich refused the change. Give this library's API key the “{permission}” permission."
+        );
+        checked(response)?;
+        Ok(())
+    }
+    fn album_id(&self, name: &str) -> Result<String> {
+        self.album_ids
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .with_context(|| format!("“{name}” is not an Immich album"))
+    }
+    fn immich_json(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+        let mut request = self.immich_request(method, self.base.join(path)?);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        Ok(serde_json::from_slice(&read_response(
+            request.send()?,
+            METADATA_LIMIT,
+        )?)?)
+    }
+    /// Asset IDs from an Immich search, following its pages up to `limit`.
+    fn immich_ids(&self, path: &str, mut body: Value, limit: usize) -> Result<Vec<String>> {
+        let mut ids = vec![];
+        let mut page = 1;
+        loop {
+            body["page"] = json!(page);
+            body["size"] = json!(PAGE_SIZE);
+            let data = self.immich_json(Method::POST, path, Some(body.clone()))?;
+            let assets = &data["assets"];
+            ids.extend(
+                assets["items"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|a| a["id"].as_str().map(str::to_owned)),
+            );
+            let next = assets["nextPage"]
+                .as_str()
+                .and_then(|s| s.parse::<usize>().ok())
+                .or_else(|| assets["nextPage"].as_u64().map(|n| n as usize));
+            match next {
+                Some(n) if n > page && ids.len() < limit => page = n,
+                _ => break,
+            }
+        }
+        ids.truncate(limit);
+        Ok(ids)
+    }
+    fn basic_auth(&self) -> String {
+        format!(
+            "Basic {}",
+            base64(format!("{}:{}", self.config.username, self.secret).as_bytes())
+        )
     }
     fn scope(&self) -> Result<Url> {
         let mut url = self.base.join("remote.php/dav/files/")?;
@@ -233,12 +314,34 @@ impl Provider for Remote {
         }
     }
     fn image(&self, photo: &Photo, preview: bool, destination: &Path) -> Result<()> {
+        self.image_at(photo, if preview { 2560 } else { 512 }, destination)
+    }
+    fn image_at(&self, photo: &Photo, edge: u32, destination: &Path) -> Result<()> {
         let bytes = if self.config.provider == "immich" {
             uuid::Uuid::parse_str(&photo.id)?;
-            let mut url = self.base.join(&format!("assets/{}/thumbnail", photo.id))?;
-            url.query_pairs_mut()
-                .append_pair("size", if preview { "preview" } else { "thumbnail" });
-            read_response(self.immich_request(Method::GET, url).send()?, IMAGE_LIMIT)?
+            // Immich keeps three renditions: a ~250 px thumbnail, a ~1440 px
+            // preview and (newer servers) a full-size JPEG.
+            // Grid sizes up to 512 px use the thumbnail, as they always
+            // have; automatic sizing measures whether the preview is worth it.
+            let sizes: &[&str] = match edge {
+                0..=512 => &["thumbnail"],
+                513..=2560 => &["preview"],
+                _ => &["fullsize", "preview"],
+            };
+            let mut result = Err(anyhow::anyhow!("No Immich rendition"));
+            for size in sizes {
+                let mut url = self.base.join(&format!("assets/{}/thumbnail", photo.id))?;
+                url.query_pairs_mut().append_pair("size", size);
+                result = self
+                    .immich_request(Method::GET, url)
+                    .send()
+                    .map_err(anyhow::Error::from)
+                    .and_then(|r| read_response(r, IMAGE_LIMIT));
+                if result.is_ok() {
+                    break;
+                }
+            }
+            result?
         } else {
             let url = self.asset_url(&photo.id)?;
             let scope_root = self.base.join("remote.php/dav/files/")?;
@@ -253,12 +356,12 @@ impl Provider for Remote {
                 .strip_prefix(root.path())
                 .context("Invalid photo path")?;
             let file = percent_decode(file)?;
-            let edge = if preview { "2560" } else { "512" };
+            let edge = edge.to_string();
             let mut url = self.base.join("index.php/core/preview.png")?;
             url.query_pairs_mut()
                 .append_pair("file", &format!("/{file}"))
-                .append_pair("x", edge)
-                .append_pair("y", edge)
+                .append_pair("x", &edge)
+                .append_pair("y", &edge)
                 .append_pair("a", "1")
                 .append_pair("forceIcon", "0");
             read_response(
@@ -271,6 +374,254 @@ impl Provider for Remote {
         };
         fs::write(destination, bytes)?;
         Ok(())
+    }
+    fn video(&self, photo: &Photo) -> Option<VideoSource> {
+        photo.duration?;
+        if self.config.provider == "immich" {
+            uuid::Uuid::parse_str(&photo.id).ok()?;
+            let url = self
+                .base
+                .join(&format!("assets/{}/video/playback", photo.id))
+                .ok()?;
+            Some(VideoSource::Remote {
+                url: url.to_string(),
+                headers: vec![("x-api-key".into(), self.secret.clone())],
+            })
+        } else {
+            Some(VideoSource::Remote {
+                url: self.asset_url(&photo.id).ok()?.to_string(),
+                headers: vec![("Authorization".into(), self.basic_auth())],
+            })
+        }
+    }
+    fn details(&self, photo: &Photo) -> Result<PhotoDetails> {
+        if self.config.provider != "immich" {
+            return Ok(PhotoDetails {
+                bytes: (photo.bytes > 0).then_some(photo.bytes),
+                ..Default::default()
+            });
+        }
+        uuid::Uuid::parse_str(&photo.id)?;
+        let a = self.immich_json(Method::GET, &format!("assets/{}", photo.id), None)?;
+        Ok(immich_details(&a))
+    }
+    fn explore(&self) -> bool {
+        self.config.provider == "immich"
+    }
+    fn albums(&self) -> Result<BTreeMap<String, BTreeSet<String>>> {
+        if self.config.provider != "immich" {
+            return Ok(BTreeMap::new());
+        }
+        let mut albums = BTreeMap::new();
+        let mut ids = std::collections::HashMap::new();
+        // Owned albums and albums shared with this user.
+        let mut listed = vec![];
+        for path in ["albums", "albums?shared=true"] {
+            let data = self.immich_json(Method::GET, path, None)?;
+            for album in data.as_array().into_iter().flatten() {
+                let Some(id) = album["id"].as_str() else {
+                    continue;
+                };
+                if !listed.iter().any(|(i, _): &(String, String)| i == id) {
+                    let name = album["albumName"].as_str().unwrap_or("").trim();
+                    listed.push((id.to_owned(), name.to_owned()));
+                }
+            }
+        }
+        for (id, base) in listed {
+            let base = if base.is_empty() {
+                "Untitled Album".to_owned()
+            } else {
+                base
+            };
+            let mut name = base.clone();
+            for n in 2.. {
+                if !albums.contains_key(&name) {
+                    break;
+                }
+                name = format!("{base} ({n})");
+            }
+            // Album responses carry their assets on older servers; newer
+            // ones are searched by album instead.
+            let detail = self.immich_json(Method::GET, &format!("albums/{id}"), None)?;
+            let members: BTreeSet<String> = match detail["assets"].as_array() {
+                Some(assets) if !assets.is_empty() || detail["assetCount"].as_u64() == Some(0) => {
+                    assets
+                        .iter()
+                        .filter_map(|a| a["id"].as_str().map(str::to_owned))
+                        .collect()
+                }
+                _ => self
+                    .immich_ids("search/metadata", json!({"albumIds": [id]}), 100_000)?
+                    .into_iter()
+                    .collect(),
+            };
+            ids.insert(name.clone(), id);
+            albums.insert(name, members);
+        }
+        *self.album_ids.lock().unwrap() = ids;
+        Ok(albums)
+    }
+    fn writable(&self) -> bool {
+        self.config.provider == "immich"
+    }
+    fn set_favorite(&self, ids: &[String], value: bool) -> Result<()> {
+        ensure!(self.writable(), "This source is read-only");
+        for id in ids {
+            uuid::Uuid::parse_str(id)?;
+        }
+        for chunk in ids.chunks(500) {
+            self.immich_write(
+                Method::PUT,
+                "assets",
+                json!({"ids": chunk, "isFavorite": value}),
+                "asset.update",
+            )?;
+        }
+        Ok(())
+    }
+    fn set_description(&self, id: &str, description: &str) -> Result<()> {
+        ensure!(self.writable(), "This source is read-only");
+        uuid::Uuid::parse_str(id)?;
+        self.immich_write(
+            Method::PUT,
+            &format!("assets/{id}"),
+            json!({"description": description}),
+            "asset.update",
+        )
+    }
+    fn create_album(&self, name: &str) -> Result<()> {
+        ensure!(self.writable(), "This source is read-only");
+        let response = self
+            .immich_request(Method::POST, self.base.join("albums")?)
+            .json(&json!({"albumName": name}))
+            .send()?;
+        ensure!(
+            response.status() != reqwest::StatusCode::FORBIDDEN,
+            "Immich refused the change. Give this library's API key the “album.create” permission."
+        );
+        let album: Value = serde_json::from_slice(&read_response(response, METADATA_LIMIT)?)?;
+        let id = album["id"]
+            .as_str()
+            .context("Immich did not return the album")?;
+        self.album_ids
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), id.to_owned());
+        Ok(())
+    }
+    fn add_to_album(&self, name: &str, ids: &[String]) -> Result<()> {
+        let album = self.album_id(name)?;
+        for chunk in ids.chunks(500) {
+            self.immich_write(
+                Method::PUT,
+                &format!("albums/{album}/assets"),
+                json!({"ids": chunk}),
+                "albumAsset.create",
+            )?;
+        }
+        Ok(())
+    }
+    fn remove_from_album(&self, name: &str, ids: &[String]) -> Result<()> {
+        let album = self.album_id(name)?;
+        for chunk in ids.chunks(500) {
+            self.immich_write(
+                Method::DELETE,
+                &format!("albums/{album}/assets"),
+                json!({"ids": chunk}),
+                "albumAsset.delete",
+            )?;
+        }
+        Ok(())
+    }
+    fn people(&self) -> Result<Vec<Person>> {
+        if self.config.provider != "immich" {
+            return Ok(vec![]);
+        }
+        let data = self.immich_json(Method::GET, "people?withHidden=false&size=1000", None)?;
+        let mut people: Vec<Person> = data["people"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|p| !p["isHidden"].as_bool().unwrap_or(false))
+            .filter_map(|p| {
+                Some(Person {
+                    id: p["id"].as_str()?.to_owned(),
+                    name: p["name"].as_str().unwrap_or_default().to_owned(),
+                })
+            })
+            .collect();
+        // Named people first, keeping the server's order (most photos first).
+        people.sort_by_key(|p| p.name.is_empty());
+        Ok(people)
+    }
+    fn person_thumbnail(&self, id: &str, destination: &Path) -> Result<()> {
+        ensure!(
+            self.config.provider == "immich",
+            "This source has no people"
+        );
+        uuid::Uuid::parse_str(id)?;
+        let bytes = read_response(
+            self.immich_request(
+                Method::GET,
+                self.base.join(&format!("people/{id}/thumbnail"))?,
+            )
+            .send()?,
+            IMAGE_LIMIT,
+        )?;
+        fs::write(destination, bytes)?;
+        Ok(())
+    }
+    fn places(&self) -> Result<Vec<Place>> {
+        if self.config.provider != "immich" {
+            return Ok(vec![]);
+        }
+        let data = self.immich_json(Method::GET, "search/explore", None)?;
+        Ok(data
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|f| f["fieldName"].as_str() == Some("exifInfo.city"))
+            .flat_map(|f| f["items"].as_array().into_iter().flatten())
+            .filter_map(|item| {
+                Some(Place {
+                    name: item["value"].as_str()?.to_owned(),
+                    photo: item["data"]["id"].as_str()?.to_owned(),
+                })
+            })
+            .collect())
+    }
+    fn matching(&self, query: &Query) -> Result<Vec<String>> {
+        if self.config.provider != "immich" {
+            return Ok(vec![]);
+        }
+        let body = match query {
+            Query::Person(id) => json!({"personIds": [id]}),
+            Query::Place(city) => json!({"city": city}),
+        };
+        self.immich_ids("search/metadata", body, 20_000)
+    }
+    fn search(&self, text: &str) -> Result<Option<Vec<String>>> {
+        if self.config.provider != "immich" || text.trim().is_empty() {
+            return Ok(None);
+        }
+        // Smart (CLIP) search needs the server's machine learning; without it
+        // fall back to searching descriptions and file names.
+        let smart = self.immich_ids("search/smart", json!({"query": text}), 1_000);
+        let ids = match smart {
+            Ok(ids) => ids,
+            Err(_) => {
+                let mut ids =
+                    self.immich_ids("search/metadata", json!({"description": text}), 1_000)?;
+                if let Ok(names) =
+                    self.immich_ids("search/metadata", json!({"originalFileName": text}), 1_000)
+                {
+                    ids.extend(names);
+                }
+                ids
+            }
+        };
+        Ok(Some(ids))
     }
     fn original(&self, id: &str, destination: &Path) -> Result<String> {
         if self.config.provider == "immich" {
@@ -318,6 +669,90 @@ impl Provider for Remote {
             Ok(name)
         }
     }
+}
+/// Immich's video length, "H:MM:SS.ffffff", in seconds.
+pub fn clock_seconds(s: &str) -> f32 {
+    s.split(':')
+        .try_fold(0f32, |total, part| {
+            Some(total * 60. + part.parse::<f32>().ok()?)
+        })
+        .filter(|s| s.is_finite() && *s >= 0.)
+        .unwrap_or(0.)
+}
+/// Details from an Immich asset response (`GET /assets/{id}`).
+pub fn immich_details(a: &Value) -> PhotoDetails {
+    let exif = &a["exifInfo"];
+    let text = |v: &Value| {
+        v.as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let number = |v: &Value| v.as_f64().map(|n| n as f32);
+    let exposure = exif["exposureTime"]
+        .as_str()
+        .and_then(|s| match s.split_once('/') {
+            Some((n, d)) => Some(n.trim().parse::<f32>().ok()? / d.trim().parse::<f32>().ok()?),
+            None => s.trim().parse().ok(),
+        });
+    // `localDateTime` is the camera's wall-clock time (sent with a Z).
+    let taken = a["localDateTime"]
+        .as_str()
+        .or(exif["dateTimeOriginal"].as_str())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.naive_utc());
+    let mut people: Vec<Person> = a["people"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| !p["isHidden"].as_bool().unwrap_or(false))
+        .filter_map(|p| {
+            Some(Person {
+                id: p["id"].as_str()?.to_owned(),
+                name: p["name"].as_str().unwrap_or_default().to_owned(),
+            })
+        })
+        .collect();
+    people.sort_by_key(|p| p.name.is_empty());
+    PhotoDetails {
+        description: text(&exif["description"]),
+        taken,
+        zone: text(&exif["timeZone"]),
+        make: text(&exif["make"]),
+        model: text(&exif["model"]),
+        lens: text(&exif["lensModel"]),
+        f_number: number(&exif["fNumber"]),
+        exposure,
+        iso: exif["iso"].as_u64().map(|n| n as u32),
+        focal_length: number(&exif["focalLength"]),
+        latitude: exif["latitude"].as_f64(),
+        longitude: exif["longitude"].as_f64(),
+        place: [&exif["city"], &exif["state"], &exif["country"]]
+            .into_iter()
+            .filter_map(text)
+            .collect(),
+        bytes: exif["fileSizeInByte"].as_u64(),
+        width: exif["exifImageWidth"].as_u64().map(|n| n as u32),
+        height: exif["exifImageHeight"].as_u64().map(|n| n as u32),
+        people,
+    }
+}
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(TABLE[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 fn date(s: Option<&str>) -> DateTime<Utc> {
     s.and_then(|s| DateTime::parse_from_rfc3339(s).ok())
@@ -371,7 +806,7 @@ fn xml(s: &str) -> String {
 }
 pub fn search_body(scope: &str, offset: usize) -> String {
     format!(
-        r#"<?xml version="1.0"?><d:searchrequest xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:ns="https://github.com/icewind1991/SearchDAV/ns"><d:basicsearch><d:select><d:prop><d:displayname/><d:getcontenttype/><d:getcontentlength/><d:getetag/><d:getlastmodified/><oc:favorite/></d:prop></d:select><d:from><d:scope><d:href>/{}</d:href><d:depth>infinity</d:depth></d:scope></d:from><d:where><d:like><d:prop><d:getcontenttype/></d:prop><d:literal>image/%</d:literal></d:like></d:where><d:orderby><d:order><d:prop><d:getlastmodified/></d:prop><d:descending/></d:order><d:order><d:prop><d:displayname/></d:prop><d:ascending/></d:order></d:orderby><d:limit><d:nresults>{PAGE_SIZE}</d:nresults><ns:firstresult>{offset}</ns:firstresult></d:limit></d:basicsearch></d:searchrequest>"#,
+        r#"<?xml version="1.0"?><d:searchrequest xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:ns="https://github.com/icewind1991/SearchDAV/ns"><d:basicsearch><d:select><d:prop><d:displayname/><d:getcontenttype/><d:getcontentlength/><d:getetag/><d:getlastmodified/><oc:favorite/></d:prop></d:select><d:from><d:scope><d:href>/{}</d:href><d:depth>infinity</d:depth></d:scope></d:from><d:where><d:or><d:like><d:prop><d:getcontenttype/></d:prop><d:literal>image/%</d:literal></d:like><d:like><d:prop><d:getcontenttype/></d:prop><d:literal>video/%</d:literal></d:like></d:or></d:where><d:orderby><d:order><d:prop><d:getlastmodified/></d:prop><d:descending/></d:order><d:order><d:prop><d:displayname/></d:prop><d:ascending/></d:order></d:orderby><d:limit><d:nresults>{PAGE_SIZE}</d:nresults><ns:firstresult>{offset}</ns:firstresult></d:limit></d:basicsearch></d:searchrequest>"#,
         xml(scope)
     )
 }
@@ -438,7 +873,9 @@ pub fn parse_nextcloud(bytes: &[u8], scope: &Url, offset: usize) -> Result<Photo
                 .find(|n| n.has_tag_name((namespace, name)))
                 .and_then(|n| n.text())
         };
-        if !prop("DAV:", "getcontenttype").is_some_and(|s| s.starts_with("image/")) {
+        let kind = prop("DAV:", "getcontenttype").unwrap_or_default();
+        let video = kind.starts_with("video/");
+        if !kind.starts_with("image/") && !video {
             continue;
         }
         let id = url.path().to_owned();
@@ -471,7 +908,8 @@ pub fn parse_nextcloud(bytes: &[u8], scope: &Url, offset: usize) -> Result<Photo
             favorite: prop("http://owncloud.org/ns", "favorite") == Some("1"),
             deleted: false,
             caption: String::new(),
-            duration: None,
+            // WebDAV has no length; zero marks a video of unknown length.
+            duration: video.then_some(0.),
         }));
     }
     Ok(PhotoPage {
@@ -483,4 +921,33 @@ pub fn parse_nextcloud(bytes: &[u8], scope: &Url, offset: usize) -> Result<Photo
         next,
         total: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn immich_details_and_video_lengths() {
+        assert_eq!(clock_seconds("0:01:05.500000"), 65.5);
+        assert_eq!(clock_seconds("bad"), 0.);
+        assert_eq!(base64(b"alice:secret"), "YWxpY2U6c2VjcmV0");
+        assert_eq!(base64(b"ab"), "YWI=");
+        let details = immich_details(&json!({
+            "localDateTime": "2025-06-01T18:30:00.000Z",
+            "exifInfo": {"make": "Apple", "model": "iPhone 15 Pro", "fNumber": 1.78,
+                "exposureTime": "1/120", "iso": 80, "focalLength": 6.86,
+                "latitude": 48.85, "longitude": 2.35, "city": "Paris", "state": "Île-de-France",
+                "country": "France", "timeZone": "Europe/Paris", "fileSizeInByte": 2048},
+            "people": [{"id": "b", "name": ""}, {"id": "a", "name": "Ana"}]
+        }));
+        assert_eq!(details.camera().as_deref(), Some("Apple iPhone 15 Pro"));
+        assert_eq!(
+            details.exposure_line().as_deref(),
+            Some("ƒ/1.8 · 1/120 s · 6.9 mm · ISO 80")
+        );
+        assert_eq!(details.place, ["Paris", "Île-de-France", "France"]);
+        assert_eq!(details.coordinates(), Some((48.85, 2.35)));
+        assert_eq!(details.people[0].name, "Ana");
+        assert_eq!(details.taken.unwrap().format("%H:%M").to_string(), "18:30");
+    }
 }

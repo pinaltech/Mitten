@@ -579,7 +579,9 @@ pub mod zoom {
         }
         /// The ladder slot showing `level`, or the closest smaller one.
         pub fn index_of(&self, level: usize) -> usize {
-            self.levels.partition_point(|&l| l <= level).saturating_sub(1)
+            self.levels
+                .partition_point(|&l| l <= level)
+                .saturating_sub(1)
         }
         /// The slots of margined levels (always the largest photos).
         pub fn margined(&self) -> Range<usize> {
@@ -904,9 +906,7 @@ pub mod zoom {
             if progress < 1. {
                 if goal != self.to && (goal < self.to) == (self.from < self.to) {
                     std::mem::swap(&mut self.from, &mut self.to);
-                    self.started = now
-                        .checked_sub(FADE.mul_f32(1. - progress))
-                        .unwrap_or(now);
+                    self.started = now.checked_sub(FADE.mul_f32(1. - progress)).unwrap_or(now);
                 }
                 return;
             }
@@ -1123,8 +1123,8 @@ pub mod zoom {
                     let half = lattice.edge / 2.;
                     let anchor = self.anchor_row as f32;
                     let first = (anchor + ((-half - lattice.y) / lattice.row).floor()).max(0.);
-                    let last = (anchor + ((area + half - lattice.y) / lattice.row).ceil())
-                        .min(rows - 1.);
+                    let last =
+                        (anchor + ((area + half - lattice.y) / lattice.row).ceil()).min(rows - 1.);
                     if last < first {
                         return vec![];
                     }
@@ -1132,7 +1132,11 @@ pub mod zoom {
                     let end = ((last as usize + 1) * l.columns)
                         .saturating_sub(l.leading)
                         .min(l.count);
-                    if start < end { vec![start..end] } else { vec![] }
+                    if start < end {
+                        vec![start..end]
+                    } else {
+                        vec![]
+                    }
                 }
                 Placement::Scaled(s) => {
                     let (top, bottom) = self.span(s, area);
@@ -1222,8 +1226,9 @@ mod tests {
         let default = GalleryLayout::new(1000., GalleryLayout::DEFAULT_LEVEL);
         assert_eq!(default.columns, 5);
         assert!(default.gap > 4. && default.padding > 8.);
-        let ratio =
-            |a: usize, b: usize| GalleryLayout::new(1000., a).edge / GalleryLayout::new(1000., b).edge;
+        let ratio = |a: usize, b: usize| {
+            GalleryLayout::new(1000., a).edge / GalleryLayout::new(1000., b).edge
+        };
         assert!(
             ratio(4, 3) > 1.25 && ratio(1, 0) > 1.25 && ratio(6, 5) > 1.6,
             "dense tiers and the step into them zoom in big steps"
@@ -1235,8 +1240,7 @@ mod tests {
             for count in 20..120 {
                 let before = GalleryLayout::new(844., level).with_count(count, true);
                 for added in [1, 2, 17, 197, 200, 3200] {
-                    let after =
-                        GalleryLayout::new(844., level).with_count(count + added, true);
+                    let after = GalleryLayout::new(844., level).with_count(count + added, true);
                     for age in 0..20 {
                         let a = before.cell(count - 1 - age);
                         let b = after.cell(count + added - 1 - age);
@@ -1322,7 +1326,8 @@ mod tests {
     }
     #[test]
     fn margined_photos_keep_their_aspect_ratio_and_gapless_ones_are_square() {
-        let margined = GalleryLayout::new(1000., GalleryLayout::DEFAULT_LEVEL).with_count(10, false);
+        let margined =
+            GalleryLayout::new(1000., GalleryLayout::DEFAULT_LEVEL).with_count(10, false);
         let cell = margined.cell(3);
         let wide = margined.frame(3, 1.5);
         assert!((wide.w - cell.edge).abs() < 0.01 && (wide.w / wide.h - 1.5).abs() < 0.01);
@@ -1367,7 +1372,10 @@ mod tests {
         for width in [312., 480., 640., 844., 1224., 1800.] {
             for keep in 0..=GalleryLayout::MAX_LEVEL {
                 let ladder = Ladder::for_width(width, keep);
-                assert_eq!(ladder.levels, (0..=GalleryLayout::MAX_LEVEL).collect::<Vec<_>>());
+                assert_eq!(
+                    ladder.levels,
+                    (0..=GalleryLayout::MAX_LEVEL).collect::<Vec<_>>()
+                );
                 assert!(
                     ladder.edges.windows(2).all(|w| w[1] > w[0] + 0.5),
                     "{width}: photos grow along the ladder"
@@ -1411,18 +1419,35 @@ mod tests {
             let frame = |level: usize| {
                 let layout = GalleryLayout::new(w, level).with_count(count, bottom_up);
                 let title = if layout.full_bleed() { 0. } else { 84. };
-                GridFrame::anchored(layout, Some((anchor, 0.5)), center.1, area, title, bottom_up, false)
+                GridFrame::anchored(
+                    layout,
+                    Some((anchor, 0.5)),
+                    center.1,
+                    area,
+                    title,
+                    bottom_up,
+                    false,
+                )
             };
             // Each margined level's own lattice is exactly its grid.
             for level in 6..=9 {
                 let f = frame(level);
                 let lattice = Lattice::of(&f, anchor);
-                assert!((lattice.x - center.0).abs() < 0.01, "the middle column is centred");
-                assert!((lattice.y - center.1).abs() < 0.5, "the anchor's row is at the centre");
+                assert!(
+                    (lattice.x - center.0).abs() < 0.01,
+                    "the middle column is centred"
+                );
+                assert!(
+                    (lattice.y - center.1).abs() < 0.5,
+                    "the anchor's row is at the centre"
+                );
                 let layer = Layer::new(&f, Placement::Slots(lattice), center, anchor);
                 for i in [0, 1, 1499, 1500, 1501, 3998, 3999] {
                     let (p, q) = (layer.frame(i, 1.5), f.screen_rect(f.layout.frame(i, 1.5)));
-                    assert!(close(p, q), "{level} {bottom_up} {i}: {p:?} {q:?} {lattice:?}");
+                    assert!(
+                        close(p, q),
+                        "{level} {bottom_up} {i}: {p:?} {q:?} {lattice:?}"
+                    );
                 }
                 // Everything that reaches the surface is listed, in order.
                 let drawn: Vec<usize> = layer.visible(area).into_iter().flatten().collect();
@@ -1446,7 +1471,10 @@ mod tests {
             for t in [0., 0.25, 0.5, 0.75, 1.] {
                 let lattice = l3.lerp(l5, t);
                 assert!((lattice.x - center.0).abs() < 0.01);
-                assert!((lattice.y - center.1).abs() < 0.5, "rows close up about the centre");
+                assert!(
+                    (lattice.y - center.1).abs() < 0.5,
+                    "rows close up about the centre"
+                );
                 let a = Layer::new(&three, Placement::Slots(lattice), center, anchor);
                 let b = Layer::new(&five, Placement::Slots(lattice), center, anchor);
                 for column in 0..3 {
@@ -1486,7 +1514,12 @@ mod tests {
         let fewer: Vec<usize> = grown.visible(area).into_iter().flatten().collect();
         assert!(fewer.len() < all.len() && fewer.iter().all(|i| all.contains(i)));
         let headers = grown.headers(area);
-        assert!(!headers.is_empty() && headers.iter().all(|h| h.scale == 2. && h.tier == Tier::Months));
+        assert!(
+            !headers.is_empty()
+                && headers
+                    .iter()
+                    .all(|h| h.scale == 2. && h.tier == Tier::Months)
+        );
         assert!(rest.radius() == 0. && grown.radius() == 0.);
     }
     #[test]
@@ -1539,7 +1572,11 @@ mod tests {
         }
         assert_eq!(z.position, held);
         z.apply(&ladder, Input::Release, false, ms(1000));
-        assert_eq!(z.phase, Phase::Settling { target: 7 }, "went far enough to land");
+        assert_eq!(
+            z.phase,
+            Phase::Settling { target: 7 },
+            "went far enough to land"
+        );
         // A tremor changes nothing; a short pinch springs back.
         let mut z = Zoom::new(8, t0);
         z.apply(&ladder, Input::Magnify(0.995), true, ms(0));
@@ -1548,7 +1585,10 @@ mod tests {
         z.apply(&ladder, Input::Magnify(0.98), true, ms(0));
         assert_eq!(z.goal(8, &ladder), 7);
         z.apply(&ladder, Input::Release, false, ms(1000));
-        assert_eq!((z.phase, z.goal(7, &ladder)), (Phase::Settling { target: 8 }, 8));
+        assert_eq!(
+            (z.phase, z.goal(7, &ladder)),
+            (Phase::Settling { target: 8 }, 8)
+        );
         // Turning around heads back; going on past a level heads to the next.
         let mut z = Zoom::new(8, t0);
         z.apply(&ladder, Input::Magnify(0.85), true, ms(0));

@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="540" viewBox="0 0 640 540" role="img" aria-labelledby="title desc">
+<title id="title">Tonto — Rim Frame</title>
+<desc id="desc">A picture frame whose landscape is the Mogollon Rim: a flat-topped escarpment crowned by ponderosa pines, a saguaro on the desert floor below and a sun in the sky, set above the shared dark teal horizon.</desc>
+<defs>
+<linearGradient id="mark" x1="40" y1="60" x2="600" y2="400" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#35CD58"/><stop offset="0.55" stop-color="#18B965"/><stop offset="1" stop-color="#008D77"/></linearGradient>
+<linearGradient id="base"><stop offset="0" stop-color="#003D40"/><stop offset="1" stop-color="#005353"/></linearGradient>
+<clipPath id="above"><path d="M0 0H640V396H600Q600 403 592 397C550 362 493 339 432 327Q320 306 208 327C147 339 90 362 48 397Q40 403 40 396H0Z"/></clipPath>
+
+</defs>
+<g clip-path="url(#above)" fill="url(#mark)">
+<path fill-rule="evenodd" d="M80 72H560A40 40 0 0 1 600 112V460H40V112A40 40 0 0 1 80 72ZM96 112H544Q560 112 560 128V214H318L268 292L80 300V128Q80 112 96 112Z"/>
+<path d="M370 216L381 188.1H374.84L392 154L409.16 188.1H403L414 216Z M408 216L422 177.3H414.16L436 130L457.84 177.3H450L464 216Z M462 216L474 185.4H467.28L486 148L504.72 185.4H498L510 216Z"/>
+<circle cx="190" cy="178" r="34"/>
+<path d="M140 300V238M140 276H124V258M140 264H156V246" fill="none" stroke="url(#mark)" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<path id="horizon" d="M40 500A280 142 0 0 1 600 500Z" fill="url(#base)"/>
+</svg>

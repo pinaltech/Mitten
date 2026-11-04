@@ -2,7 +2,108 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
+    sync::atomic::{AtomicU32, Ordering},
+    time::Duration,
 };
+
+/// Pixel edges of the images each zoom level draws: the Years and Months
+/// squares, the margined grid's thumbnails and the viewer's preview.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ImageSizes {
+    pub micro: u32,
+    pub mini: u32,
+    pub grid: u32,
+    pub viewer: u32,
+}
+impl Default for ImageSizes {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+impl ImageSizes {
+    pub const DEFAULT: Self = Self {
+        micro: 64,
+        mini: 160,
+        grid: 512,
+        viewer: 2560,
+    };
+    /// The choices Settings offers for each level.
+    pub const MICRO: [u32; 3] = [48, 64, 96];
+    pub const MINI: [u32; 3] = [128, 160, 256];
+    pub const GRID: [u32; 5] = [256, 384, 512, 768, 1024];
+    pub const VIEWER: [u32; 4] = [1280, 1920, 2560, 3840];
+    /// Keeps every edge within the range its level supports.
+    pub fn clamped(self) -> Self {
+        Self {
+            micro: self.micro.clamp(32, 128),
+            mini: self.mini.clamp(96, 320),
+            grid: self.grid.clamp(192, 1536),
+            viewer: self.viewer.clamp(1024, 4096),
+        }
+    }
+}
+static MICRO_EDGE: AtomicU32 = AtomicU32::new(ImageSizes::DEFAULT.micro);
+static MINI_EDGE: AtomicU32 = AtomicU32::new(ImageSizes::DEFAULT.mini);
+static GRID_EDGE: AtomicU32 = AtomicU32::new(ImageSizes::DEFAULT.grid);
+static VIEWER_EDGE: AtomicU32 = AtomicU32::new(ImageSizes::DEFAULT.viewer);
+/// The sizes every source renders at from now on (process-wide, because the
+/// cache files of each size live side by side).
+pub fn set_image_sizes(sizes: ImageSizes) {
+    let sizes = sizes.clamped();
+    MICRO_EDGE.store(sizes.micro, Ordering::Relaxed);
+    MINI_EDGE.store(sizes.mini, Ordering::Relaxed);
+    GRID_EDGE.store(sizes.grid, Ordering::Relaxed);
+    VIEWER_EDGE.store(sizes.viewer, Ordering::Relaxed);
+}
+pub fn image_sizes() -> ImageSizes {
+    ImageSizes {
+        micro: MICRO_EDGE.load(Ordering::Relaxed),
+        mini: MINI_EDGE.load(Ordering::Relaxed),
+        grid: GRID_EDGE.load(Ordering::Relaxed),
+        viewer: VIEWER_EDGE.load(Ordering::Relaxed),
+    }
+}
+/// Cache file stem for an image `kind` rendered at `edge`: the historical
+/// name at the default size, so existing caches stay valid.
+pub fn sized_kind(kind: &str, edge: u32) -> String {
+    let default = if kind == "preview" {
+        ImageSizes::DEFAULT.viewer
+    } else {
+        ImageSizes::DEFAULT.grid
+    };
+    if edge == default {
+        kind.to_owned()
+    } else {
+        format!("{kind}{edge}")
+    }
+}
+/// A grid thumbnail should arrive within this (median, per photo) for the
+/// largest zoom level to fill quickly; the viewer can afford longer.
+pub const GRID_BUDGET: Duration = Duration::from_millis(140);
+pub const VIEWER_BUDGET: Duration = Duration::from_millis(700);
+/// The largest candidate whose median time stays within `budget`, measuring
+/// ascending sizes and stopping at the first that is too slow. The smallest
+/// candidate is the floor. `measure` times one photo (`sample`) at an edge.
+pub fn fastest_reasonable(
+    candidates: &[u32],
+    samples: usize,
+    budget: Duration,
+    mut measure: impl FnMut(u32, usize) -> Option<Duration>,
+) -> u32 {
+    let mut chosen = candidates[0];
+    for &edge in candidates {
+        let mut times: Vec<Duration> = (0..samples).filter_map(|i| measure(edge, i)).collect();
+        if times.is_empty() {
+            break;
+        }
+        times.sort();
+        if times[times.len() / 2] > budget {
+            break;
+        }
+        chosen = edge;
+    }
+    chosen
+}
 
 pub const PAGE_SIZE: usize = 200;
 /// Concurrent thumbnail/derivative jobs. Decoding is CPU-bound, so this
@@ -94,7 +195,7 @@ pub enum Square {
 impl Square {
     /// The smallest square that stays sharp for a tile `pixels` wide.
     pub fn for_pixels(pixels: f32) -> Self {
-        if pixels <= 64. {
+        if pixels <= MICRO_EDGE.load(Ordering::Relaxed) as f32 {
             Self::Micro
         } else {
             Self::Mini
@@ -102,8 +203,8 @@ impl Square {
     }
     pub fn edge(self) -> u32 {
         match self {
-            Self::Micro => 64,
-            Self::Mini => 160,
+            Self::Micro => MICRO_EDGE.load(Ordering::Relaxed),
+            Self::Mini => MINI_EDGE.load(Ordering::Relaxed),
         }
     }
     pub fn index(self) -> usize {
@@ -248,5 +349,27 @@ mod tests {
         }
         assert_eq!(Square::for_pixels(22.), Square::Micro);
         assert_eq!(Square::for_pixels(152.), Square::Mini);
+    }
+    #[test]
+    fn automatic_sizes_pick_the_largest_size_within_budget() {
+        let budget = Duration::from_millis(100);
+        // Time grows with size; 768 px is the first too slow.
+        let chosen = fastest_reasonable(&ImageSizes::GRID, 3, budget, |edge, _| {
+            Some(Duration::from_millis(edge as u64 / 6))
+        });
+        assert_eq!(chosen, 512);
+        // Even the smallest too slow: still the smallest, never nothing.
+        let floor = fastest_reasonable(&ImageSizes::GRID, 3, budget, |_, _| {
+            Some(Duration::from_secs(1))
+        });
+        assert_eq!(floor, 256);
+        // One slow outlier does not decide the median.
+        let outlier = fastest_reasonable(&ImageSizes::GRID, 3, budget, |_, i| {
+            Some(Duration::from_millis(if i == 0 { 900 } else { 20 }))
+        });
+        assert_eq!(outlier, 1024);
+        assert_eq!(sized_kind("thumb", 512), "thumb");
+        assert_eq!(sized_kind("thumb", 768), "thumb768");
+        assert_eq!(sized_kind("preview", 2560), "preview");
     }
 }

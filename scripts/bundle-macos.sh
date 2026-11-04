@@ -5,7 +5,7 @@ build_dir="${CARGO_TARGET_DIR:-$project_dir/../DesertUI/target}"
 cargo build --locked --manifest-path "$project_dir/Cargo.toml" --target-dir "$build_dir"
 # Validate what Foundation actually sees for the executable before packaging.
 "$build_dir/debug/desert-photos" --verify-photo-permissions
-app_dir="$project_dir/target/GPUI Photos.app"
+app_dir="$project_dir/target/Tonto.app"
 mkdir -p "$app_dir/Contents/MacOS"
 # Replace the executable inode so macOS does not reuse a stale code-signature
 # cache entry when rebuilding an already launched development bundle.

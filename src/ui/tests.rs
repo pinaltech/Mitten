@@ -188,6 +188,9 @@ fn onboarding_exposes_service_logos_and_connection_forms(cx: &mut TestAppContext
     cx.simulate_resize(size(px(360.), px(540.)));
     frame(cx);
     inside(cx, "topbar", 360., 540.);
+    inside(cx, "app-brand", 360., 540.);
+    let brand = bounds(cx, "app-brand");
+    assert!(brand.size.width >= px(20.) && brand.left() < bounds(cx, "topbar").center().x);
     assert!(cx.debug_bounds("welcome").is_some());
     for name in [
         "connect-local-folder",
@@ -673,7 +676,11 @@ fn accent_settings_removal_gapless_gallery_and_side_navigation(cx: &mut TestAppC
         assert_eq!(app.gallery_level, default);
         assert!((z.zoom.position - (default as f32 - 0.6)).abs() < 1e-3);
         let (a, b, t) = z.ladder.pair(z.zoom.position);
-        assert_eq!((a, b), (default - 1, default), "between the levels around the size");
+        assert_eq!(
+            (a, b),
+            (default - 1, default),
+            "between the levels around the size"
+        );
         assert!((t - 0.4).abs() < 1e-3);
         assert_eq!(z.zoom.phase, Phase::Held);
     });
@@ -688,7 +695,9 @@ fn accent_settings_removal_gapless_gallery_and_side_navigation(cx: &mut TestAppC
         assert!((z.position - (GalleryLayout::DEFAULT_LEVEL as f32 - 0.6)).abs() < 1e-3);
     });
     // Lifting lands on the level the photos were already fading to.
-    app.update_in(cx, |app, _, cx| app.zoom_library(ZoomInput::Release, true, cx));
+    app.update_in(cx, |app, _, cx| {
+        app.zoom_library(ZoomInput::Release, true, cx)
+    });
     advance_gallery_animation(cx);
     app.read_with(cx, |app, _| {
         assert!(app.gallery_zoom.is_none());

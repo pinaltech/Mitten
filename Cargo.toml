@@ -24,6 +24,7 @@ desert-ui = { path = "../DesertUI", version = "0.1.0", optional = true }
 directories = "6"
 gpui = { version = "=0.2.2", optional = true }
 gpui-component = { version = "=0.5.1", optional = true }
+kamadak-exif = "0.6"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "tiff", "bmp"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="540" viewBox="0 0 640 540" role="img" aria-labelledby="title desc">
+<title id="title">Tonto</title>
+<desc id="desc">The Mogollon Rim escarpment with bold camera viewfinder brackets cut from it in negative space.</desc>
+<defs>
+<linearGradient id="mark" x1="40" y1="60" x2="600" y2="400" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#35CD58"/><stop offset="0.55" stop-color="#18B965"/><stop offset="1" stop-color="#008D77"/></linearGradient>
+<linearGradient id="base"><stop offset="0" stop-color="#003D40"/><stop offset="1" stop-color="#005353"/></linearGradient>
+<clipPath id="above"><path d="M0 0H640V396H600Q600 403 592 397C550 362 493 339 432 327Q320 306 208 327C147 339 90 362 48 397Q40 403 40 396H0Z"/></clipPath>
+<mask id="focus" maskUnits="userSpaceOnUse" x="0" y="0" width="640" height="540"><rect width="640" height="540" fill="#fff"/>
+<path d="M330 212V156H386M482 156H538V212M538 236V292H482M386 292H330V236" fill="none" stroke="#000" stroke-width="26" stroke-linecap="round" stroke-linejoin="round"/>
+</mask>
+</defs>
+<g clip-path="url(#above)"><path mask="url(#focus)" fill="url(#mark)" d="M40 396V336L196 286L262 120Q268 104 286 104H568Q600 104 600 136V396Z"/></g>
+<path d="M40 500A280 142 0 0 1 600 500Z" fill="url(#base)"/>
+</svg>

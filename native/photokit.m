@@ -1,5 +1,7 @@
 #import <Photos/Photos.h>
 #import <AppKit/AppKit.h>
+#import <ImageIO/ImageIO.h>
+#import <CoreLocation/CoreLocation.h>
 
 // Called exclusively by background workers. A fetch result is a lazy PhotoKit
 // snapshot: enumerating a page never loads image data for the rest of the library.
@@ -194,6 +196,99 @@ char *dp_photos_albums(void) {
             }
         }
         return reply(@{@"albums": albums});
+    }
+}
+static id json_value(id value) {
+    if ([value isKindOfClass:[NSString class]] && [value length] == 0) return nil;
+    return value;
+}
+// Info-panel details. Location comes with the asset; capture settings need the
+// extra step of reading the image data's EXIF (local data only: never an
+// iCloud download just to show settings). Place names come from reverse
+// geocoding, waited on for a few seconds at most.
+char *dp_photos_details(const char *identifier) {
+    @autoreleasepool {
+        NSString *configurationError = usage_error();
+        if (configurationError) return failure(configurationError);
+        if (!authorized()) return failure(@"Photos permission is unavailable. Reconnect Apple Photos.");
+        PHAsset *asset = [PHAsset fetchAssetsWithLocalIdentifiers:@[[NSString stringWithUTF8String:identifier]] options:nil].firstObject;
+        if (!asset) return failure(@"This photo is no longer available.");
+        NSMutableDictionary *result = [NSMutableDictionary new];
+        result[@"width"] = @(asset.pixelWidth);
+        result[@"height"] = @(asset.pixelHeight);
+        CLLocation *location = asset.location;
+        if (location && CLLocationCoordinate2DIsValid(location.coordinate)) {
+            result[@"latitude"] = @(location.coordinate.latitude);
+            result[@"longitude"] = @(location.coordinate.longitude);
+        }
+        PHAssetResource *resource = nil;
+        PHAssetResourceType wanted = asset.mediaType == PHAssetMediaTypeVideo ? PHAssetResourceTypeVideo : PHAssetResourceTypePhoto;
+        for (PHAssetResource *r in [PHAssetResource assetResourcesForAsset:asset]) if (r.type == wanted) { resource = r; break; }
+        @try {
+            id size = [resource valueForKey:@"fileSize"];
+            if ([size isKindOfClass:[NSNumber class]]) result[@"bytes"] = size;
+        } @catch (NSException *e) { (void)e; }
+        if (asset.mediaType == PHAssetMediaTypeImage) {
+            PHImageRequestOptions *options = [PHImageRequestOptions new];
+            options.synchronous = YES;
+            options.networkAccessAllowed = NO;
+            options.version = PHImageRequestOptionsVersionOriginal;
+            __block NSData *bytes = nil;
+            [[PHImageManager defaultManager] requestImageDataAndOrientationForAsset:asset options:options
+                resultHandler:^(NSData *data, NSString *uti, CGImagePropertyOrientation orientation, NSDictionary *info) {
+                    (void)uti; (void)orientation; (void)info;
+                    bytes = data;
+                }];
+            CGImageSourceRef source = bytes ? CGImageSourceCreateWithData((__bridge CFDataRef)bytes, NULL) : NULL;
+            if (source) {
+                NSDictionary *properties = CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(source, 0, NULL));
+                CFRelease(source);
+                NSDictionary *exif = properties[(NSString *)kCGImagePropertyExifDictionary];
+                NSDictionary *tiff = properties[(NSString *)kCGImagePropertyTIFFDictionary];
+                NSDictionary *aux = properties[(NSString *)kCGImagePropertyExifAuxDictionary];
+                result[@"make"] = json_value(tiff[(NSString *)kCGImagePropertyTIFFMake]);
+                result[@"model"] = json_value(tiff[(NSString *)kCGImagePropertyTIFFModel]);
+                result[@"lens"] = json_value(exif[(NSString *)kCGImagePropertyExifLensModel] ?: aux[(NSString *)kCGImagePropertyExifAuxLensModel]);
+                result[@"f_number"] = exif[(NSString *)kCGImagePropertyExifFNumber];
+                result[@"exposure"] = exif[(NSString *)kCGImagePropertyExifExposureTime];
+                result[@"focal_length"] = exif[(NSString *)kCGImagePropertyExifFocalLength];
+                NSArray *iso = exif[(NSString *)kCGImagePropertyExifISOSpeedRatings];
+                if ([iso isKindOfClass:[NSArray class]]) result[@"iso"] = iso.firstObject;
+                result[@"zone"] = json_value(exif[@"OffsetTimeOriginal"]);
+                NSString *original = exif[(NSString *)kCGImagePropertyExifDateTimeOriginal];
+                if ([original isKindOfClass:[NSString class]] && original.length >= 19) {
+                    // "2024:05:01 18:30:00" → "2024-05-01T18:30:00"
+                    NSMutableString *iso8601 = [original substringToIndex:19].mutableCopy;
+                    [iso8601 replaceCharactersInRange:NSMakeRange(4, 1) withString:@"-"];
+                    [iso8601 replaceCharactersInRange:NSMakeRange(7, 1) withString:@"-"];
+                    [iso8601 replaceCharactersInRange:NSMakeRange(10, 1) withString:@"T"];
+                    result[@"taken"] = iso8601;
+                }
+            }
+        }
+        if (!result[@"taken"] && asset.creationDate) {
+            NSDateFormatter *format = [NSDateFormatter new];
+            format.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+            format.dateFormat = @"yyyy-MM-dd'T'HH:mm:ss";
+            result[@"taken"] = [format stringFromDate:asset.creationDate];
+        }
+        if (location) {
+            dispatch_semaphore_t done = dispatch_semaphore_create(0);
+            __block NSArray *names = nil;
+            CLGeocoder *geocoder = [CLGeocoder new];
+            [geocoder reverseGeocodeLocation:location completionHandler:^(NSArray<CLPlacemark *> *marks, NSError *error) {
+                (void)error;
+                CLPlacemark *mark = marks.firstObject;
+                NSMutableArray *parts = [NSMutableArray new];
+                for (NSString *part in @[mark.locality ?: @"", mark.administrativeArea ?: @"", mark.country ?: @""])
+                    if (part.length && ![parts containsObject:part]) [parts addObject:part];
+                names = parts;
+                dispatch_semaphore_signal(done);
+            }];
+            if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC)) != 0) [geocoder cancelGeocode];
+            if (names.count) result[@"place"] = names;
+        }
+        return reply(result);
     }
 }
 void dp_photos_free(char *value) { free(value); }
