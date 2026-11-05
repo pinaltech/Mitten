@@ -18,6 +18,10 @@ pub const BATCH: usize = 32;
 const BUDGET: usize = 640 << 20;
 /// Most queued requests remembered per frame (the rest are asked again later).
 const QUEUE: usize = 6000;
+/// Decoded ThumbHash placeholders kept (each at most 32×32).
+const PLACEHOLDERS: usize = 12_000;
+/// ThumbHashes decoded per frame; the rest follow on the next frames.
+const PLACEHOLDERS_PER_FRAME: usize = 600;
 
 #[derive(Default)]
 struct Entry {
@@ -35,6 +39,14 @@ pub struct Tiles {
     pub generation: u64,
     queue: Vec<(Arc<Photo>, Square)>,
     queued: HashSet<(usize, Square)>,
+    /// Photos per decode request; 0 means [`BATCH`].
+    pub batch: usize,
+    /// Blurred stand-ins decoded from sources' ThumbHashes, with the frame
+    /// each was last drawn.
+    placeholders: HashMap<String, (Arc<RenderImage>, u64)>,
+    placeholder_budget: usize,
+    /// A placeholder was skipped this frame for lack of budget.
+    pub placeholders_pending: bool,
     // Evicted images whose atlas textures are released on the next paint.
     graveyard: Vec<Arc<RenderImage>>,
 }
@@ -47,6 +59,42 @@ impl Tiles {
         self.frame += 1;
         self.queue.clear();
         self.queued.clear();
+        self.placeholder_budget = PLACEHOLDERS_PER_FRAME;
+        self.placeholders_pending = false;
+    }
+    /// The photo's blurred ThumbHash stand-in, if the source sent one.
+    pub fn placeholder(&mut self, photo: &Photo) -> Option<Arc<RenderImage>> {
+        let hash = photo.placeholder.as_ref()?;
+        let frame = self.frame;
+        if let Some((image, drawn)) = self.placeholders.get_mut(photo.fingerprint.as_str()) {
+            *drawn = frame;
+            return Some(image.clone());
+        }
+        if self.placeholder_budget == 0 {
+            self.placeholders_pending = true;
+            return None;
+        }
+        self.placeholder_budget -= 1;
+        let (w, h, pixels) = desert_photos::loading::thumbhash_bgra(hash)?;
+        let buffer = image::RgbaImage::from_raw(w, h, pixels)?;
+        let image = Arc::new(RenderImage::new([image::Frame::new(buffer)]));
+        if self.placeholders.len() >= PLACEHOLDERS {
+            let mut old: Vec<_> = self
+                .placeholders
+                .iter()
+                .filter(|(_, (_, drawn))| drawn + 1 < frame)
+                .map(|(k, (_, drawn))| (*drawn, k.clone()))
+                .collect();
+            old.sort_unstable();
+            for (_, key) in old.into_iter().take(PLACEHOLDERS / 4) {
+                if let Some((image, _)) = self.placeholders.remove(&key) {
+                    self.graveyard.push(image);
+                }
+            }
+        }
+        self.placeholders
+            .insert(photo.fingerprint.clone(), (image.clone(), frame));
+        Some(image)
     }
     /// Frees textures evicted since the last paint. Call before painting.
     pub fn release(&mut self, window: &mut Window) {
@@ -58,6 +106,8 @@ impl Tiles {
         for (_, entry) in self.entries.drain() {
             self.graveyard.extend(entry.images.into_iter().flatten());
         }
+        self.graveyard
+            .extend(self.placeholders.drain().map(|(_, (image, _))| image));
         self.bytes = 0;
         self.generation += 1;
         self.in_flight = 0;
@@ -110,7 +160,8 @@ impl Tiles {
         let mut batch = vec![];
         let mut rest = vec![];
         for (photo, c) in std::mem::take(&mut self.queue) {
-            if c == class && batch.len() < BATCH {
+            let size = if self.batch == 0 { BATCH } else { self.batch };
+            if c == class && batch.len() < size {
                 let entry = self.entries.entry(photo.fingerprint.clone()).or_default();
                 if entry.images[c.index()].is_none() && !entry.pending[c.index()] {
                     entry.pending[c.index()] = true;
@@ -165,6 +216,10 @@ impl Tiles {
                 }
             }
         }
+    }
+    #[cfg(test)]
+    pub fn has_placeholder(&self, photo: &Photo) -> bool {
+        self.placeholders.contains_key(photo.fingerprint.as_str())
     }
     #[cfg(test)]
     pub fn ready(&self, photo: &Photo) -> bool {

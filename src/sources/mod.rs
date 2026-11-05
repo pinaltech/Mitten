@@ -221,6 +221,11 @@ pub trait Provider: Send + Sync {
     fn page(&self, cursor: Option<&str>) -> Result<PhotoPage>;
     fn image(&self, photo: &Photo, preview: bool, destination: &Path) -> Result<()>;
     fn original(&self, id: &str, destination: &Path) -> Result<String>;
+    /// The edge this source actually delivers when asked for `edge`: sizes
+    /// that map to the same server rendition share one cache file.
+    fn rendition(&self, edge: u32) -> u32 {
+        edge
+    }
     /// Batched grid squares straight from the source (see
     /// [`PhotosDriver::squares`]); `None` crops them from thumbnails instead.
     fn squares(&self, _photos: &[Arc<Photo>], _edge: u32) -> Option<Vec<Result<Vec<u8>>>> {
@@ -318,6 +323,9 @@ fn normalize(path: &Path, edge: u32) -> Result<()> {
     }
     Ok(())
 }
+/// Image downloads one connected source runs at once (browsers allow six
+/// connections per server; the viewer may briefly add two more).
+const IMAGE_REQUESTS: usize = 6;
 pub struct ConnectedPhotos {
     source: Source,
     provider: Box<dyn Provider>,
@@ -325,6 +333,8 @@ pub struct ConnectedPhotos {
     /// Provider albums, fetched with each catalog's first page.
     synced: Mutex<BTreeMap<String, BTreeSet<String>>>,
     written: Mutex<Written>,
+    /// Image downloads in flight against the server.
+    gate: crate::loading::Gate,
 }
 impl ConnectedPhotos {
     pub fn new(source: Source, provider: Box<dyn Provider>) -> Result<Self> {
@@ -336,6 +346,7 @@ impl ConnectedPhotos {
             annotations,
             synced: Mutex::default(),
             written: Mutex::default(),
+            gate: crate::loading::Gate::new(IMAGE_REQUESTS),
         })
     }
     /// Sends favorites and descriptions made while this source was still
@@ -368,7 +379,9 @@ impl ConnectedPhotos {
     }
     fn image(&self, photo: &Photo, preview: bool) -> Result<PathBuf> {
         let sizes = crate::loading::image_sizes();
-        let edge = if preview { sizes.viewer } else { sizes.grid };
+        let edge = self
+            .provider
+            .rendition(if preview { sizes.viewer } else { sizes.grid });
         let kind = crate::loading::sized_kind(if preview { "preview" } else { "thumb" }, edge);
         let directory = self.source.path.join(".desert-photos/cache");
         let path = directory.join(format!("{}-{kind}.jpg", digest(&photo.fingerprint)));
@@ -376,7 +389,14 @@ impl ConnectedPhotos {
             return Ok(path);
         }
         let temp = tempfile::NamedTempFile::new_in(&directory)?;
-        self.provider.image_at(photo, edge, temp.path())?;
+        {
+            let _pass = self.gate.enter(preview);
+            // Another request may have fetched it while this one waited.
+            if path.is_file() {
+                return Ok(path);
+            }
+            self.provider.image_at(photo, edge, temp.path())?;
+        }
         // A provider's preview of a moving photo is usually the animated file
         // itself: keep its motion before the still JPEG replaces it.
         if preview && crate::storage::may_move(&photo.name) {
@@ -492,7 +512,30 @@ impl PhotosDriver for ConnectedPhotos {
     }
     fn squares(&self, photos: &[Arc<Photo>], edge: u32) -> Vec<Result<Vec<u8>>> {
         let Some(mut squares) = self.provider.squares(photos, edge) else {
-            return crate::storage::squares_from_thumbnails(self, photos, edge);
+            // Thumbnails download side by side (the gate bounds them), so a
+            // batch takes about as long as its slowest photo, not their sum.
+            return std::thread::scope(|s| {
+                let jobs: Vec<_> = photos
+                    .iter()
+                    .map(|photo| {
+                        s.spawn(move || {
+                            crate::storage::squares_from_thumbnails(
+                                self,
+                                std::slice::from_ref(photo),
+                                edge,
+                            )
+                            .pop()
+                            .unwrap_or_else(|| Err(anyhow::anyhow!("No square")))
+                        })
+                    })
+                    .collect();
+                jobs.into_iter()
+                    .map(|job| {
+                        job.join()
+                            .unwrap_or_else(|_| Err(anyhow::anyhow!("Square failed")))
+                    })
+                    .collect()
+            });
         };
         // Anything the source could not supply quickly is cropped from its
         // regular thumbnail instead.
@@ -510,7 +553,11 @@ impl PhotosDriver for ConnectedPhotos {
     fn video(&self, photo: &Photo) -> Option<VideoSource> {
         self.provider.video(photo)
     }
+    fn rendition(&self, edge: u32) -> u32 {
+        self.provider.rendition(edge)
+    }
     fn sample(&self, photo: &Photo, edge: u32) -> Result<()> {
+        let edge = self.provider.rendition(edge);
         let temp = tempfile::NamedTempFile::new()?;
         self.provider.image_at(photo, edge, temp.path())?;
         normalize(temp.path(), edge)

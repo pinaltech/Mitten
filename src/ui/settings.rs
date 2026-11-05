@@ -448,10 +448,25 @@ impl PhotosApp {
     pub(super) fn apply_sizes(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let path = self.driver.as_ref().map(|d| d.source().path);
         let sizes = self.preferences.sizes_for(path.as_deref());
-        if sizes == loading::image_sizes() {
+        let current = loading::image_sizes();
+        if sizes == current {
             return;
         }
         loading::set_image_sizes(sizes);
+        // Sizes the source serves as the same rendition keep every image
+        // already loaded (the cache files are shared).
+        let same = |a: loading::ImageSizes, b: loading::ImageSizes| match &self.driver {
+            Some(d) => {
+                a.micro == b.micro
+                    && a.mini == b.mini
+                    && d.rendition(a.grid) == d.rendition(b.grid)
+                    && d.rendition(a.viewer) == d.rendition(b.viewer)
+            }
+            None => a == b,
+        };
+        if same(sizes.clamped(), current) {
+            return;
+        }
         self.thumbnails.clear();
         self.previews.clear();
         self.tiles.clear();
@@ -459,7 +474,8 @@ impl PhotosApp {
         self.failed.clear();
         self.failed_order.clear();
         self.decoded_preview = None;
-        self.generation += 1;
+        // Only image jobs are stale; catalog pages in flight still land.
+        self.image_epoch += 1;
         self.render_cache.update(cx, |cache, cx| cache.clear(w, cx));
         self.viewer_render_cache
             .update(cx, |cache, cx| cache.clear(w, cx));
@@ -489,7 +505,7 @@ impl PhotosApp {
         cx.spawn(async move |this, cx| {
             let sizes = cx
                 .background_executor()
-                .spawn(async move { storage::measure_sizes(driver.as_ref(), &photos) })
+                .offload(move || storage::measure_sizes(driver.as_ref(), &photos))
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.measuring = false;

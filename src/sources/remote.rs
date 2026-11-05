@@ -147,6 +147,11 @@ impl Remote {
                     .as_str()
                     .unwrap_or_default()
                     .into(),
+                placeholder: a["thumbhash"]
+                    .as_str()
+                    .and_then(crate::loading::base64_decode)
+                    .filter(|h| (5..=64).contains(&h.len()))
+                    .map(Into::into),
             }));
         }
         let next = assets["nextCursor"]
@@ -315,6 +320,19 @@ impl Provider for Remote {
     }
     fn image(&self, photo: &Photo, preview: bool, destination: &Path) -> Result<()> {
         self.image_at(photo, if preview { 2560 } else { 512 }, destination)
+    }
+    /// Immich serves fixed renditions: every grid size up to 512 px is its
+    /// ~250 px thumbnail and every viewer size up to 2560 px its ~1440 px
+    /// preview, so those sizes are the same image (and the same cache file).
+    fn rendition(&self, edge: u32) -> u32 {
+        if self.config.provider != "immich" {
+            return edge;
+        }
+        match edge {
+            0..=512 => 512,
+            1025..=2560 => 2560,
+            _ => edge,
+        }
     }
     fn image_at(&self, photo: &Photo, edge: u32, destination: &Path) -> Result<()> {
         let bytes = if self.config.provider == "immich" {
@@ -910,6 +928,7 @@ pub fn parse_nextcloud(bytes: &[u8], scope: &Url, offset: usize) -> Result<Photo
             caption: String::new(),
             // WebDAV has no length; zero marks a video of unknown length.
             duration: video.then_some(0.),
+            placeholder: None,
         }));
     }
     Ok(PhotoPage {

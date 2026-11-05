@@ -1,5 +1,25 @@
 # Verification
 
+## Linux overlays, stuck cataloging and slow-server loading — November 5, 2026
+
+- **71 tests pass** (five new: ThumbHash/base64 decoding, the request gate,
+  a catalog that keeps paging when image sizes change mid-page, marquee and
+  closing photo in an inset window, placeholders standing in for failed
+  images). The two UI regressions were confirmed to fail on the previous
+  behaviour (the marquee was off by exactly the 13 px Linux inset; the
+  catalog stayed `loading` forever). Formatting passes; strict Clippy passes
+  except three lints already present in untouched code.
+- Release build succeeds and launched cleanly on Wayland with an isolated
+  profile. Real Immich browsing speed, trackpad feel and the visual result on
+  a fractional-scale display were **not** measured here.
+- Root causes: overlays in window coordinates were drawn inside a root inset
+  by gpui-component's 12 px client shadow plus a 1 px border; finishing
+  automatic sizing bumped the catalog generation, orphaning the page in
+  flight; painted grids and the viewer had no fallback while squares or
+  previews loaded; remote I/O blocked GPUI's executor threads, fetched
+  squares serially in batches of 32 and re-measured sizes that map to the
+  same Immich rendition (then dropped every loaded image).
+
 ## Gallery zoom reflow and cursor — November 1, 2026
 
 - Zoom transitions no longer draw a layout below its natural size, so the grid

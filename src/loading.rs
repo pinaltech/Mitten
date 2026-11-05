@@ -280,6 +280,197 @@ pub fn cached_square(
     Ok(pixels)
 }
 
+/// Decodes standard (padded or unpadded) base64, as sources send ThumbHashes.
+pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in text.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Decodes a [ThumbHash](https://evanw.github.io/thumbhash/) into a small
+/// (at most 32 px) BGRA image, GPUI's upload order: a blurred stand-in at the
+/// photo's own aspect ratio. Returns `(width, height, pixels)`.
+#[allow(clippy::needless_range_loop)] // mirrors the reference DCT
+pub fn thumbhash_bgra(hash: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    use std::f32::consts::PI;
+    if hash.len() < 5 {
+        return None;
+    }
+    let header24 = u32::from(hash[0]) | u32::from(hash[1]) << 8 | u32::from(hash[2]) << 16;
+    let header16 = u32::from(hash[3]) | u32::from(hash[4]) << 8;
+    let l_dc = (header24 & 63) as f32 / 63.;
+    let p_dc = ((header24 >> 6) & 63) as f32 / 31.5 - 1.;
+    let q_dc = ((header24 >> 12) & 63) as f32 / 31.5 - 1.;
+    let l_scale = ((header24 >> 18) & 31) as f32 / 31.;
+    let has_alpha = header24 >> 23 != 0;
+    let p_scale = ((header16 >> 3) & 63) as f32 / 63.;
+    let q_scale = ((header16 >> 9) & 63) as f32 / 63.;
+    let landscape = header16 >> 15 != 0;
+    let side = (header16 & 7) as usize;
+    let long = if has_alpha { 5 } else { 7 };
+    let (lx, ly) = if landscape {
+        (long, side)
+    } else {
+        (side, long)
+    };
+    // The aspect ratio is approximated from the stored (unclamped) counts.
+    let ratio = lx.max(1) as f32 / ly.max(1) as f32;
+    let (lx, ly) = (lx.max(3), ly.max(3));
+    if has_alpha && hash.len() < 6 {
+        return None;
+    }
+    let a_dc = if has_alpha {
+        f32::from(hash[5] & 15) / 15.
+    } else {
+        1.
+    };
+    let a_scale = if has_alpha {
+        f32::from(hash[5] >> 4) / 15.
+    } else {
+        0.
+    };
+    let mut index = 0usize;
+    let start = if has_alpha { 6 } else { 5 };
+    let mut channel = |nx: usize, ny: usize, scale: f32| -> Option<Vec<f32>> {
+        let mut ac = vec![];
+        for cy in 0..ny {
+            let mut cx = usize::from(cy == 0);
+            while cx * ny < nx * (ny - cy) {
+                let byte = *hash.get(start + (index >> 1))?;
+                let nibble = (byte >> ((index & 1) << 2)) & 15;
+                ac.push((f32::from(nibble) / 7.5 - 1.) * scale);
+                index += 1;
+                cx += 1;
+            }
+        }
+        Some(ac)
+    };
+    let l_ac = channel(lx, ly, l_scale)?;
+    let p_ac = channel(3, 3, p_scale * 1.25)?;
+    let q_ac = channel(3, 3, q_scale * 1.25)?;
+    let a_ac = if has_alpha {
+        channel(5, 5, a_scale)?
+    } else {
+        vec![]
+    };
+    let (w, h) = if ratio > 1. {
+        (32, (32. / ratio).round().max(1.) as usize)
+    } else {
+        ((32. * ratio).round().max(1.) as usize, 32)
+    };
+    let n = lx.max(if has_alpha { 5 } else { 3 });
+    let m = ly.max(if has_alpha { 5 } else { 3 });
+    let mut fx = vec![0f32; n];
+    let mut fy = vec![0f32; m];
+    let mut out = Vec::with_capacity(w * h * 4);
+    let byte = |v: f32| (255. * v.clamp(0., 1.)).round() as u8;
+    for y in 0..h {
+        for (cy, f) in fy.iter_mut().enumerate() {
+            *f = (PI / h as f32 * (y as f32 + 0.5) * cy as f32).cos();
+        }
+        for x in 0..w {
+            for (cx, f) in fx.iter_mut().enumerate() {
+                *f = (PI / w as f32 * (x as f32 + 0.5) * cx as f32).cos();
+            }
+            let (mut l, mut p, mut q, mut a) = (l_dc, p_dc, q_dc, a_dc);
+            let mut j = 0;
+            for cy in 0..ly {
+                let fy2 = fy[cy] * 2.;
+                let mut cx = usize::from(cy == 0);
+                while cx * ly < lx * (ly - cy) {
+                    l += l_ac[j] * fx[cx] * fy2;
+                    j += 1;
+                    cx += 1;
+                }
+            }
+            let mut j = 0;
+            for cy in 0..3 {
+                let fy2 = fy[cy] * 2.;
+                for cx in usize::from(cy == 0)..3 - cy {
+                    let f = fx[cx] * fy2;
+                    p += p_ac[j] * f;
+                    q += q_ac[j] * f;
+                    j += 1;
+                }
+            }
+            if has_alpha {
+                let mut j = 0;
+                for cy in 0..5 {
+                    let fy2 = fy[cy] * 2.;
+                    for cx in usize::from(cy == 0)..5 - cy {
+                        a += a_ac[j] * fx[cx] * fy2;
+                        j += 1;
+                    }
+                }
+            }
+            let b = l - 2. / 3. * p;
+            let r = (3. * l - b + q) / 2.;
+            let g = r - q;
+            out.extend_from_slice(&[byte(b), byte(g), byte(r), byte(a)]);
+        }
+    }
+    Some((w as u32, h as u32, out))
+}
+
+/// Bounds how many image requests run against one source at once, so a slow
+/// server is never flooded and the viewer's photo (`urgent`) goes first.
+pub struct Gate {
+    limit: usize,
+    state: std::sync::Mutex<(usize, usize)>,
+    ready: std::sync::Condvar,
+}
+pub struct Pass<'a>(&'a Gate);
+impl Drop for Pass<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().0 -= 1;
+        self.0.ready.notify_all();
+    }
+}
+impl Gate {
+    pub const fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            state: std::sync::Mutex::new((0, 0)),
+            ready: std::sync::Condvar::new(),
+        }
+    }
+    /// Waits for a slot. Urgent requests take any free slot ahead of waiting
+    /// grid requests and may run two beyond the limit.
+    pub fn enter(&self, urgent: bool) -> Pass<'_> {
+        let mut state = self.state.lock().unwrap();
+        if urgent {
+            state.1 += 1;
+            while state.0 >= self.limit + 2 {
+                state = self.ready.wait(state).unwrap();
+            }
+            state.1 -= 1;
+        } else {
+            while state.0 >= self.limit || state.1 > 0 {
+                state = self.ready.wait(state).unwrap();
+            }
+        }
+        state.0 += 1;
+        Pass(self)
+    }
+}
+
 /// Convert just the requested virtual rows to a bounded photo range.
 pub fn visible_range(
     rows: std::ops::Range<usize>,
@@ -292,6 +483,42 @@ pub fn visible_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn base64_and_thumbhash_decode() {
+        assert_eq!(base64_decode("aGVsbG8=").unwrap(), b"hello");
+        assert_eq!(base64_decode("aGVsbG8").unwrap(), b"hello");
+        assert!(base64_decode("a$").is_none());
+        // A landscape hash of a flat colour: L = 63/63, no AC energy.
+        let mut hash = vec![0u8; 25];
+        let header24: u32 = 63 | 32 << 6 | 32 << 12;
+        let header16: u32 = 3 | 1 << 15;
+        hash[..3].copy_from_slice(&header24.to_le_bytes()[..3]);
+        hash[3..5].copy_from_slice(&header16.to_le_bytes()[..2]);
+        hash[5..].fill(0x77);
+        let (w, h, pixels) = thumbhash_bgra(&hash).unwrap();
+        assert_eq!((w, h), (32, 14));
+        assert_eq!(pixels.len(), (w * h * 4) as usize);
+        assert!(pixels.chunks(4).all(|p| p[3] == 255 && p[1] > 240));
+        assert!(thumbhash_bgra(&hash[..4]).is_none());
+        assert!(thumbhash_bgra(&hash[..8]).is_none());
+    }
+    #[test]
+    fn gate_bounds_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let gate = Gate::new(3);
+        let (now, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        std::thread::scope(|s| {
+            for _ in 0..12 {
+                s.spawn(|| {
+                    let _pass = gate.enter(false);
+                    peak.fetch_max(now.fetch_add(1, SeqCst) + 1, SeqCst);
+                    std::thread::sleep(Duration::from_millis(5));
+                    now.fetch_sub(1, SeqCst);
+                });
+            }
+        });
+        assert!(peak.load(SeqCst) <= 3);
+    }
     #[test]
     fn scrolling_a_million_photos_keeps_caches_bounded() {
         let mut thumbs = BoundedCache::new(THUMBNAIL_CACHE);

@@ -393,6 +393,7 @@ struct SourceCounters {
     previews: std::sync::atomic::AtomicUsize,
     originals: std::sync::atomic::AtomicUsize,
     fail_page: std::sync::atomic::AtomicBool,
+    fail_images: std::sync::atomic::AtomicBool,
     total: std::sync::atomic::AtomicUsize,
 }
 struct StressSource(Arc<SourceCounters>);
@@ -412,6 +413,7 @@ fn synthetic_photos(range: std::ops::Range<usize>) -> Vec<Arc<Photo>> {
                 caption: String::new(),
                 fingerprint: format!("{i}-v1"),
                 duration: None,
+                placeholder: None,
             })
         })
         .collect()
@@ -445,6 +447,9 @@ impl desert_photos::sources::Provider for StressSource {
             &self.0.thumbs
         }
         .fetch_add(1, SeqCst);
+        if self.0.fail_images.load(SeqCst) {
+            anyhow::bail!("Server unavailable");
+        }
         image::RgbImage::new(32, 24).save_with_format(destination, image::ImageFormat::Png)?;
         Ok(())
     }
@@ -2191,4 +2196,239 @@ fn header_dates_do_not_flicker_while_cataloging(cx: &mut TestAppContext) {
             assert_eq!(before_grid, settled);
         }
     }
+}
+
+/// A flat grey ThumbHash: what a source sends before any image loads.
+fn grey_thumbhash() -> Arc<[u8]> {
+    let mut hash = vec![0x77u8; 25];
+    let header24: u32 = 40 | 32 << 6 | 32 << 12;
+    let header16: u32 = 3 | 1 << 15;
+    hash[..3].copy_from_slice(&header24.to_le_bytes()[..3]);
+    hash[3..5].copy_from_slice(&header16.to_le_bytes()[..2]);
+    hash.into()
+}
+
+/// Draws the app inset in its window, as Linux's client-side shadow and
+/// border do around the real window.
+struct Inset(Entity<PhotosApp>);
+impl Render for Inset {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .pl(px(13.))
+            .pt(px(13.))
+            .child(self.0.clone())
+    }
+}
+
+#[gpui::test]
+fn marquee_and_closing_photo_follow_the_pointer_in_an_inset_window(cx: &mut TestAppContext) {
+    cx.update(ui::init);
+    let data = tempfile::tempdir().unwrap();
+    let driver: Arc<dyn PhotosDriver> = Arc::new(
+        desert_photos::sources::ConnectedPhotos::new(
+            Source {
+                driver: "synthetic".into(),
+                path: data.path().join("source"),
+            },
+            Box::new(StressSource(Arc::new(SourceCounters::default()))),
+        )
+        .unwrap(),
+    );
+    let mut entity = None;
+    let settings = data.path().join("settings.json");
+    let window = cx.add_window(|w, cx| {
+        let app = cx.new(|cx| {
+            let mut app = PhotosApp::new(settings, w, cx);
+            app.preferences.bottom_to_top = false;
+            app.driver = Some(driver);
+            app.library.photos = synthetic_photos(0..40);
+            app.library_changed();
+            app
+        });
+        entity = Some(app.clone());
+        let inset = cx.new(|_| Inset(app));
+        Root::new(inset, w, cx)
+    });
+    let app = entity.unwrap();
+    let cx = VisualTestContext::from_window(window.into(), cx).into_mut();
+    cx.simulate_resize(size(px(1060.), px(760.)));
+    frame(cx);
+    frame(cx);
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.overlay_origin, point(px(13.), px(13.)));
+    });
+
+    // The marquee starts under the pointer and ends under it.
+    let first = bounds(cx, "photo-tile-0");
+    let last = bounds(cx, "photo-tile-2");
+    let start = point(first.left() - px(5.), first.top() + px(4.));
+    cx.simulate_event(MouseDownEvent {
+        position: start,
+        button: MouseButton::Left,
+        ..Default::default()
+    });
+    cx.simulate_event(MouseMoveEvent {
+        position: last.center(),
+        pressed_button: Some(MouseButton::Left),
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    let marquee = bounds(cx, "marquee");
+    assert!(
+        (marquee.origin.x - start.x).abs() < px(0.5),
+        "{marquee:?} {start:?}"
+    );
+    assert!(
+        (marquee.origin.y - start.y).abs() < px(0.5),
+        "{marquee:?} {start:?}"
+    );
+    assert!((marquee.bottom_right().x - last.center().x).abs() < px(0.5));
+    cx.simulate_event(MouseUpEvent {
+        position: last.center(),
+        button: MouseButton::Left,
+        ..Default::default()
+    });
+    frame(cx);
+
+    // A closing photo lands exactly on its tile.
+    let tile = bounds(cx, "photo-tile-5");
+    for _ in 0..2 {
+        app.update_in(cx, |app, w, cx| {
+            app.select(5, true, Modifiers::none(), w, cx)
+        });
+        frame(cx);
+        settle(cx);
+    }
+    click(cx, "close-viewer");
+    frame(cx);
+    // Whatever its progress (animations run on the real clock), the flying
+    // photo is drawn on the path from the viewer to its tile, in window
+    // coordinates.
+    let (from, to) = app.read_with(cx, |app, _| {
+        let closing = app.closing.as_ref().expect("the photo flies back");
+        let (to, _) = closing.target.flatten().expect("to its tile");
+        (closing.bounds, to)
+    });
+    assert!((to.center().x - tile.center().x).abs() < px(1.));
+    let drawn = bounds(cx, "closing-photo");
+    let t = (drawn.size.width - from.size.width) / (to.size.width - from.size.width);
+    let expected = lerp_bounds(from, to, t);
+    assert!(
+        (drawn.origin.x - expected.origin.x).abs() < px(1.)
+            && (drawn.origin.y - expected.origin.y).abs() < px(1.),
+        "drawn at {drawn:?}, expected {expected:?}"
+    );
+}
+
+#[gpui::test]
+fn catalog_keeps_paging_when_image_sizes_change_mid_page(cx: &mut TestAppContext) {
+    use std::sync::atomic::Ordering::SeqCst;
+    cx.update(ui::init);
+    let directory = tempfile::tempdir().unwrap();
+    let counters = Arc::new(SourceCounters::default());
+    counters.total.store(1200, SeqCst);
+    let driver: Arc<dyn PhotosDriver> = Arc::new(
+        desert_photos::sources::ConnectedPhotos::new(
+            Source {
+                driver: "synthetic".into(),
+                path: directory.path().join("source"),
+            },
+            Box::new(StressSource(counters.clone())),
+        )
+        .unwrap(),
+    );
+    let first = driver.page(None).unwrap();
+    let mut entity = None;
+    let window = cx.add_window(|w, cx| {
+        let view = cx.new(|cx| {
+            let mut app = PhotosApp::new(directory.path().join("settings.json"), w, cx);
+            app.finish_connection(Ok((driver.clone(), first)), w, cx);
+            app
+        });
+        entity = Some(view.clone());
+        Root::new(view, w, cx)
+    });
+    let entity = entity.unwrap();
+    let cx = VisualTestContext::from_window(window.into(), cx).into_mut();
+    // Automatic sizing finishes while the next catalog page is in flight.
+    entity.update_in(cx, |app, w, cx| {
+        assert!(app.loading, "a catalog page is in flight");
+        let before = desert_photos::loading::image_sizes();
+        app.preferences.automatic_sizes = false;
+        app.preferences.image_sizes = desert_photos::loading::ImageSizes {
+            viewer: if before.viewer == 1920 { 1280 } else { 1920 },
+            ..before
+        };
+        let epoch = app.image_epoch;
+        app.apply_sizes(w, cx);
+        // Sizes are process-wide and other tests run alongside.
+        desert_photos::loading::set_image_sizes(before);
+        assert_eq!(app.image_epoch, epoch + 1, "image jobs were invalidated");
+    });
+    for _ in 0..4 {
+        frame(cx);
+    }
+    entity.read_with(cx, |app, _| {
+        assert!(!app.loading && !app.has_more && !app.page_failed);
+        assert_eq!(app.library.photos.len(), 1200);
+    });
+}
+
+#[gpui::test]
+fn placeholders_stand_in_until_images_arrive(cx: &mut TestAppContext) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let photos: Vec<_> = synthetic_photos(0..400)
+        .into_iter()
+        .map(|p| {
+            let mut p = (*p).clone();
+            p.placeholder = Some(grey_thumbhash());
+            Arc::new(p)
+        })
+        .collect();
+    cx.update(ui::init);
+    let data = tempfile::tempdir().unwrap();
+    let counters = Arc::new(SourceCounters::default());
+    counters.fail_images.store(true, SeqCst);
+    let driver: Arc<dyn PhotosDriver> = Arc::new(
+        desert_photos::sources::ConnectedPhotos::new(
+            Source {
+                driver: "synthetic".into(),
+                path: data.path().join("source"),
+            },
+            Box::new(StressSource(counters)),
+        )
+        .unwrap(),
+    );
+    let mut entity = None;
+    let window = cx.add_window(|w, cx| {
+        let app = cx.new(|cx| {
+            let mut app = PhotosApp::new(data.path().join("settings.json"), w, cx);
+            app.preferences.bottom_to_top = false;
+            app.driver = Some(driver);
+            app.library.photos = photos.clone();
+            app.library_changed();
+            app.gallery_level = 0;
+            app
+        });
+        entity = Some(app.clone());
+        Root::new(app, w, cx)
+    });
+    let app = entity.unwrap();
+    let cx = VisualTestContext::from_window(window.into(), cx).into_mut();
+    cx.simulate_resize(size(px(1060.), px(760.)));
+    frame(cx);
+    frame(cx);
+    // No square can load, so the painted grid draws every photo's placeholder.
+    app.read_with(cx, |app, cx| {
+        assert!(app.gallery_layout(cx).dense());
+        assert!(!app.tiles.ready(&photos[0]));
+        assert!(app.tiles.has_placeholder(&photos[0]));
+    });
+    // A photo opens as its placeholder rather than an empty "loading" screen.
+    app.update_in(cx, |app, w, cx| {
+        app.select(0, true, Modifiers::none(), w, cx)
+    });
+    frame(cx);
+    assert!(cx.debug_bounds("viewer-image-layers").is_some());
 }

@@ -100,7 +100,7 @@ impl PhotosApp {
             cx.spawn(async move |this, cx| {
                 let details = cx
                     .background_executor()
-                    .spawn(async move { driver.details(&lookup) })
+                    .offload(move || driver.details(&lookup))
                     .await
                     .unwrap_or_default();
                 let _ = this.update(cx, |this, cx| {
@@ -138,7 +138,7 @@ impl PhotosApp {
             cx.spawn(async move |this, cx| {
                 let result = cx
                     .background_executor()
-                    .spawn(async move {
+                    .offload(move || {
                         std::fs::create_dir_all(&cache)?;
                         map::static_map(&template, at, MAP_ZOOM, MAP_SIZE, &cache)
                     })
@@ -174,7 +174,7 @@ impl PhotosApp {
             let lookup = id.clone();
             let face = cx
                 .background_executor()
-                .spawn(async move { driver.person_thumbnail(&lookup).ok() })
+                .offload(move || driver.person_thumbnail(&lookup).ok())
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.faces_pending.remove(&id);
@@ -206,7 +206,7 @@ impl PhotosApp {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { driver.caption(&id, &caption) })
+                .offload(move || driver.caption(&id, &caption))
                 .await;
             let _ = this.update(cx, |this, cx| {
                 match result {

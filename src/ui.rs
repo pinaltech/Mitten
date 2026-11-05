@@ -217,6 +217,7 @@ fn zoom_image(
             .get(photo, Square::for_pixels(pixels))
             .or_else(thumbnail)
     }
+    .or_else(|| tiles.placeholder(photo))
 }
 fn aspect_of(
     photo: &Photo,
@@ -489,6 +490,11 @@ pub struct PhotosApp {
     catalog_epoch: u64,
     viewport: ui::image_viewport::ImageViewport,
     viewer_bounds: Bounds<Pixels>,
+    /// Where this view's content box sits in the window. Pointer events and
+    /// measured bounds are in window coordinates, but overlays are laid out
+    /// inside the root, which Linux insets for the client-side shadow and
+    /// border.
+    overlay_origin: Point<Pixels>,
     // A pinch may close the viewer only if it began at 100%; the close
     // commits on release, never mid-gesture.
     pinch_armed: bool,
@@ -513,6 +519,9 @@ pub struct PhotosApp {
     busy: bool,
     loading: bool,
     generation: u64,
+    /// Bumped when image sizes change: image results from before are stale,
+    /// but catalog pages and scans in flight are not.
+    image_epoch: u64,
     scan_epoch: u64,
     scroll: UniformListScrollHandle,
     map_url: Entity<InputState>,
@@ -718,6 +727,7 @@ impl PhotosApp {
             catalog_epoch: 0,
             viewport: Default::default(),
             viewer_bounds: Bounds::default(),
+            overlay_origin: Point::default(),
             pinch_armed: false,
             dismiss_pinch: None,
             viewer_base: None,
@@ -740,6 +750,7 @@ impl PhotosApp {
             busy: false,
             loading: false,
             generation: 0,
+            image_epoch: 0,
             scan_epoch: 0,
             scroll: UniformListScrollHandle::new(),
             map_url,
@@ -1033,7 +1044,7 @@ impl PhotosApp {
         cx.spawn_in(w, async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move {
+                .offload(move || {
                     let driver: Arc<dyn PhotosDriver> = Arc::from(storage::open_source(&source)?);
                     let page = driver.page(None)?;
                     Ok::<_, anyhow::Error>((driver, page))
@@ -1240,7 +1251,7 @@ impl PhotosApp {
             cx.spawn_in(w, async move |this, cx| {
                 let result = cx
                     .background_executor()
-                    .spawn(async move {
+                    .offload(move || {
                         let source = config.source(&data)?;
                         let remote =
                             desert_photos::sources::remote::Remote::new(config.clone(), &secret)?;
@@ -1277,7 +1288,7 @@ impl PhotosApp {
         self.loading = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let result = cx.background_executor().spawn(async move {
+            let result = cx.background_executor().offload(move || {
                 let started=std::time::Instant::now();
                 let mut combined=PhotoPage::default(); let mut cursor=cursor; let mut visited=BTreeSet::new();
                 for _ in 0..16 {
@@ -1378,7 +1389,7 @@ impl PhotosApp {
         cx.spawn_in(w, async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { driver.scan() })
+                .offload(move || driver.scan())
                 .await;
             let _ = this.update_in(cx, |this, _, cx| {
                 if this.generation != generation || this.scan_epoch != epoch {
@@ -1433,7 +1444,7 @@ impl PhotosApp {
         cx.spawn_in(w, async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move {
+                .offload(move || {
                     let result = work(driver.clone());
                     let refreshed = driver.refresh_library(library);
                     (result, refreshed)
@@ -2127,13 +2138,13 @@ impl PhotosApp {
             return;
         };
         self.pending.insert(key.clone());
-        let generation = self.generation;
+        let generation = (self.generation, self.image_epoch);
         let fingerprint = photo.fingerprint.clone();
         let photo = photo.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move {
+                .offload(move || {
                     if preview {
                         driver.preview(&photo)
                     } else {
@@ -2142,7 +2153,7 @@ impl PhotosApp {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if this.generation != generation {
+                if (this.generation, this.image_epoch) != generation {
                     return;
                 }
                 this.pending.remove(&key);
@@ -2853,6 +2864,18 @@ impl PhotosApp {
             && self
                 .failed
                 .contains(&format!("{}-thumb", photo.fingerprint));
+        // Until the thumbnail is decoded, the tile shows a square already
+        // decoded for a gapless grid, else the blurred placeholder.
+        let decoded = thumb
+            .as_ref()
+            .is_some_and(|path| self.render_cache.read(cx).ready(path).is_some());
+        let stand_in = if decoded || failed {
+            None
+        } else {
+            self.tiles
+                .peek(photo)
+                .or_else(|| self.tiles.placeholder(photo))
+        };
         let drag = DragPhotos {
             ids: Default::default(),
             seed: photo.id.clone(),
@@ -2922,12 +2945,23 @@ impl PhotosApp {
                         .absolute()
                         .inset_0(),
                     )
+                    .when_some(stand_in.clone(), |d, image| {
+                        d.child(
+                            img(image)
+                                .absolute()
+                                .inset_0()
+                                .size_full()
+                                .object_fit(ObjectFit::Cover),
+                        )
+                    })
                     .child(if let Some(path) = thumb {
                         img(Arc::<std::path::Path>::from(path))
                             .image_cache(&self.render_cache)
                             .size_full()
                             .object_fit(ObjectFit::Cover)
                             .into_any_element()
+                    } else if stand_in.is_some() {
+                        div().into_any_element()
                     } else {
                         div()
                             .size_full()
@@ -3538,15 +3572,28 @@ impl PhotosApp {
                         .filter(|c| matches!(c.target, Some(Some(_))))
                         .map(|c| c.id.clone());
                     let mut tiles = Vec::with_capacity(layout.columns * 64);
+                    let cache = this.render_cache.read(cx);
                     for i in layout.visible(top, bottom).into_iter().flatten() {
                         let Some(photo) = photos.get(&this.library, i) else {
                             continue;
                         };
                         let cell = layout.cell(i);
-                        let image = this
-                            .tiles
-                            .get(photo, class)
-                            .filter(|_| landing.as_ref() != Some(&photo.id));
+                        // Until its square is decoded, a photo keeps showing
+                        // what was already drawn of it (its grid thumbnail,
+                        // when zooming out from larger tiles), else its
+                        // blurred placeholder: tiles never blank out.
+                        let image = if landing.as_ref() == Some(&photo.id) {
+                            None
+                        } else {
+                            this.tiles
+                                .get(photo, class)
+                                .or_else(|| {
+                                    this.thumbnails
+                                        .peek(&photo.fingerprint)
+                                        .and_then(|path| cache.ready(path))
+                                })
+                                .or_else(|| this.tiles.placeholder(photo))
+                        };
                         let selected = any_selected && this.selected.contains(&photo.id);
                         // Video lengths, where the square has room for them.
                         let length = photo
@@ -3571,6 +3618,9 @@ impl PhotosApp {
                             this.tiles.want(photo, class);
                         }
                     }
+                    if this.tiles.placeholders_pending {
+                        cx.notify();
+                    }
                     this.pump_tiles(cx);
                     tiles
                 })
@@ -3582,14 +3632,8 @@ impl PhotosApp {
                 // with thousands of tiles) and lets every sprite batch together.
                 w.paint_layer(bounds, |w| {
                     for (bounds, image, _, _) in &tiles {
-                        match image {
-                            Some(image) => {
-                                let _ = w.paint_image(*bounds, corners, image.clone(), 0, false);
-                            }
-                            None => {
-                                w.paint_quad(fill(*bounds, rgb(c.surface)).corner_radii(corners))
-                            }
-                        }
+                        // Squares paint directly; stand-ins are cropped.
+                        paint_cover(*bounds, image.clone(), radius, c, w);
                     }
                 });
                 // Outlines go in a later layer, above the images.
@@ -3653,7 +3697,17 @@ impl PhotosApp {
         let Some(driver) = self.driver.clone() else {
             return;
         };
-        while self.tiles.in_flight < tiles::workers() {
+        // Connected sources download squares: small batches land as soon as
+        // their photos arrive, and few in flight keep the server working on
+        // what is on screen now rather than where the grid was a second ago.
+        let workers = if driver.paged() {
+            self.tiles.batch = 4;
+            3
+        } else {
+            self.tiles.batch = 0;
+            tiles::workers()
+        };
+        while self.tiles.in_flight < workers {
             let Some((class, batch)) = self.tiles.take_batch() else {
                 break;
             };
@@ -3663,7 +3717,7 @@ impl PhotosApp {
             cx.spawn(async move |this, cx| {
                 let results = cx
                     .background_executor()
-                    .spawn(async move { tiles::decode(driver.as_ref(), class, &batch) })
+                    .offload(move || tiles::decode(driver.as_ref(), class, &batch))
                     .await;
                 let _ = this.update(cx, |this, cx| {
                     if this.tiles.generation != generation {
@@ -3709,15 +3763,15 @@ impl PhotosApp {
         }
         let driver = self.driver.clone()?;
         self.pending.insert(key.clone());
-        let generation = self.generation;
+        let generation = (self.generation, self.image_epoch);
         let photo = photo.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { driver.motion(&photo, large) })
+                .offload(move || driver.motion(&photo, large))
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if this.generation != generation {
+                if (this.generation, this.image_epoch) != generation {
                     return;
                 }
                 this.pending.remove(&key);
@@ -3985,8 +4039,15 @@ impl PhotosApp {
                     canvas(
                         move |_, _, cx| {
                             entity.update(cx, |this, cx| {
+                                // A connected source leaves half its slots to
+                                // whatever scrolls into view next.
+                                let limit = if this.driver.as_ref().is_some_and(|d| d.paged()) {
+                                    THUMBNAIL_JOBS / 2
+                                } else {
+                                    THUMBNAIL_JOBS
+                                };
                                 for photo in photos {
-                                    if this.pending.len() >= THUMBNAIL_JOBS {
+                                    if this.pending.len() >= limit {
                                         break;
                                     }
                                     this.request_image(&photo, false, cx);
@@ -4000,6 +4061,9 @@ impl PhotosApp {
                 );
             }
 
+            if self.tiles.placeholders_pending {
+                cx.notify();
+            }
             let entity = cx.entity();
             let measured = layout.clone();
             let list_top = if bottom_up {
@@ -4254,6 +4318,9 @@ impl PhotosApp {
             .bg(rgb(c.bg));
         if let Some(photo) = photo {
             self.request_image(&photo, true, cx);
+            // The grid thumbnail shows at the photo's own shape until the
+            // preview arrives (gapless grids only decoded a square of it).
+            self.request_image(&photo, false, cx);
             let motion = self.motion_path(&photo, true, cx);
             let thumbnail_path = self.thumbnails.get(&photo.fingerprint).cloned();
             let preview_path = self.previews.get(&photo.fingerprint).cloned();
@@ -4293,7 +4360,20 @@ impl PhotosApp {
             let instant = self.viewer_shown.as_ref().is_some_and(|(_, ready)| *ready);
             let thumbnail = thumbnail.filter(|_| !instant || preview.is_none());
             let base = thumbnail.clone().or_else(|| preview.clone());
-            self.viewer_base = preview.clone().or_else(|| thumbnail.clone());
+            // Before either is decoded (a photo opened from a gapless grid,
+            // whose tiles are squares), the photo grows out of its tile as
+            // the square or blurred placeholder it showed there.
+            let stand_in = if base.is_none() {
+                self.tiles
+                    .peek(&photo)
+                    .or_else(|| self.tiles.placeholder(&photo))
+            } else {
+                None
+            };
+            self.viewer_base = preview
+                .clone()
+                .or_else(|| thumbnail.clone())
+                .or_else(|| stand_in.clone());
             let viewer_index = self
                 .photo_index
                 .get(&photo.id)
@@ -4501,142 +4581,165 @@ impl PhotosApp {
                         .absolute()
                         .inset_0(),
                     )
-                    .child(if let Some(base) = base {
-                        let layers = div()
-                            .id("viewer-image-layers")
-                            .debug_selector(|| "viewer-image-layers".into())
-                            .absolute()
-                            .left(px(position.0 + self.swipe_offset))
-                            .top(px(position.1))
-                            .w(px(size.0))
-                            .h(px(size.1))
-                            .child(img(base).size_full().object_fit(ObjectFit::Contain))
-                            .when_some(preview.filter(|_| thumbnail.is_some()), |d, preview| {
-                                d.child(
-                                    img(preview)
-                                        .absolute()
-                                        .inset_0()
-                                        .size_full()
-                                        .object_fit(ObjectFit::Contain)
-                                        .with_animation(
-                                            SharedString::from(format!(
-                                                "upgrade-{}",
-                                                photo.fingerprint
-                                            )),
-                                            Animation::new(Duration::from_millis(140)),
-                                            |image, t| image.opacity(t),
-                                        ),
-                                )
-                            })
-                            .when_some(motion, |d, path| {
-                                // GIFs and animated WebPs play over their still.
-                                d.child(
-                                    img(Arc::<std::path::Path>::from(path))
-                                        .image_cache(&self.motion_cache)
-                                        .absolute()
-                                        .inset_0()
-                                        .size_full()
-                                        .object_fit(ObjectFit::Contain)
-                                        .id(SharedString::from(format!(
-                                            "viewer-motion-{}",
-                                            photo.fingerprint
-                                        ))),
-                                )
-                            })
-                            // Where the native player cannot play it (other
-                            // platforms), a video opens in the system's player.
-                            .when(
-                                photo.duration.is_some()
-                                    && (video.is_none() || !cfg!(target_os = "macos")),
-                                |d| {
-                                    let external = photo.clone();
+                    .child(
+                        if let Some((base, fit)) = base
+                            .map(|b| (b, ObjectFit::Contain))
+                            .or_else(|| stand_in.map(|b| (b, ObjectFit::Cover)))
+                        {
+                            let layers = div()
+                                .id("viewer-image-layers")
+                                .debug_selector(|| "viewer-image-layers".into())
+                                .absolute()
+                                .left(px(position.0 + self.swipe_offset))
+                                .top(px(position.1))
+                                .w(px(size.0))
+                                .h(px(size.1))
+                                .child(img(base).size_full().object_fit(fit))
+                                .when_some(preview.filter(|_| thumbnail.is_some()), |d, preview| {
                                     d.child(
-                                        div()
+                                        img(preview)
                                             .absolute()
                                             .inset_0()
-                                            .flex()
-                                            .flex_col()
-                                            .items_center()
-                                            .justify_center()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .id("play-external")
-                                                    .debug_selector(|| "play-external".into())
-                                                    .size(px(56.))
-                                                    .rounded_full()
-                                                    .bg(rgba(0x15181dbb))
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .cursor_pointer()
-                                                    .hover(|s| s.bg(rgba(0x15181dee)))
-                                                    .child(kit::glyph("play", 24., 0xffffff))
-                                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                                        cx.stop_propagation()
-                                                    })
-                                                    .on_click(cx.listener(
-                                                        move |this, _, w, cx| {
-                                                            this.play_externally(
-                                                                external.as_ref().clone(),
-                                                                w,
-                                                                cx,
-                                                            )
-                                                        },
-                                                    )),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py_1()
-                                                    .rounded(px(6.))
-                                                    .bg(rgba(0x15181dbb))
-                                                    .text_size(px(11.))
-                                                    .text_color(rgb(0xffffff))
-                                                    .child("Play in your video player"),
+                                            .size_full()
+                                            .object_fit(ObjectFit::Contain)
+                                            .with_animation(
+                                                SharedString::from(format!(
+                                                    "upgrade-{}",
+                                                    photo.fingerprint
+                                                )),
+                                                Animation::new(Duration::from_millis(140)),
+                                                |image, t| image.opacity(t),
                                             ),
                                     )
-                                },
-                            );
-                        match opening {
-                            Some((epoch, from)) => {
-                                let to = Bounds::new(
-                                    point(px(position.0), px(position.1)),
-                                    gpui::size(px(size.0), px(size.1)),
+                                })
+                                .when_some(motion, |d, path| {
+                                    // GIFs and animated WebPs play over their still.
+                                    d.child(
+                                        img(Arc::<std::path::Path>::from(path))
+                                            .image_cache(&self.motion_cache)
+                                            .absolute()
+                                            .inset_0()
+                                            .size_full()
+                                            .object_fit(ObjectFit::Contain)
+                                            .id(SharedString::from(format!(
+                                                "viewer-motion-{}",
+                                                photo.fingerprint
+                                            ))),
+                                    )
+                                })
+                                // Where the native player cannot play it (other
+                                // platforms), a video opens in the system's player.
+                                .when(
+                                    photo.duration.is_some()
+                                        && (video.is_none() || !cfg!(target_os = "macos")),
+                                    |d| {
+                                        let external = photo.clone();
+                                        d.child(
+                                            div()
+                                                .absolute()
+                                                .inset_0()
+                                                .flex()
+                                                .flex_col()
+                                                .items_center()
+                                                .justify_center()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .id("play-external")
+                                                        .debug_selector(|| "play-external".into())
+                                                        .size(px(56.))
+                                                        .rounded_full()
+                                                        .bg(rgba(0x15181dbb))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .cursor_pointer()
+                                                        .hover(|s| s.bg(rgba(0x15181dee)))
+                                                        .child(kit::glyph("play", 24., 0xffffff))
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            |_, _, cx| cx.stop_propagation(),
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            move |this, _, w, cx| {
+                                                                this.play_externally(
+                                                                    external.as_ref().clone(),
+                                                                    w,
+                                                                    cx,
+                                                                )
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .px_2()
+                                                        .py_1()
+                                                        .rounded(px(6.))
+                                                        .bg(rgba(0x15181dbb))
+                                                        .text_size(px(11.))
+                                                        .text_color(rgb(0xffffff))
+                                                        .child("Play in your video player"),
+                                                ),
+                                        )
+                                    },
                                 );
-                                layers
+                            match opening {
+                                Some((epoch, from)) => {
+                                    let to = Bounds::new(
+                                        point(px(position.0), px(position.1)),
+                                        gpui::size(px(size.0), px(size.1)),
+                                    );
+                                    layers
+                                        .with_animation(
+                                            ElementId::NamedInteger("opening-photo".into(), epoch),
+                                            Animation::new(OPEN_ANIMATION)
+                                                .with_easing(ease_out_quint()),
+                                            move |d, t| {
+                                                let r = lerp_bounds(from, to, t);
+                                                d.left(r.origin.x)
+                                                    .top(r.origin.y)
+                                                    .w(r.size.width)
+                                                    .h(r.size.height)
+                                            },
+                                        )
+                                        .into_any_element()
+                                }
+                                None => layers.into_any_element(),
+                            }
+                        } else {
+                            let failed = self
+                                .failed
+                                .contains(&format!("{}-preview", photo.fingerprint));
+                            let message = kit::empty(
+                                "photos",
+                                if failed {
+                                    "Preview unavailable"
+                                } else {
+                                    "Loading preview…"
+                                },
+                                "",
+                                c,
+                            );
+                            if failed {
+                                message.into_any_element()
+                            } else {
+                                // Only a slow load says so: a photo that arrives
+                                // promptly never flashes a loading screen.
+                                div()
+                                    .size_full()
+                                    .child(message)
                                     .with_animation(
-                                        ElementId::NamedInteger("opening-photo".into(), epoch),
-                                        Animation::new(OPEN_ANIMATION)
-                                            .with_easing(ease_out_quint()),
-                                        move |d, t| {
-                                            let r = lerp_bounds(from, to, t);
-                                            d.left(r.origin.x)
-                                                .top(r.origin.y)
-                                                .w(r.size.width)
-                                                .h(r.size.height)
-                                        },
+                                        SharedString::from(format!(
+                                            "viewer-wait-{}",
+                                            photo.fingerprint
+                                        )),
+                                        Animation::new(Duration::from_millis(900)),
+                                        |d, t| d.opacity(((t - 0.6) / 0.4).clamp(0., 1.)),
                                     )
                                     .into_any_element()
                             }
-                            None => layers.into_any_element(),
-                        }
-                    } else {
-                        kit::empty(
-                            "photos",
-                            if self
-                                .failed
-                                .contains(&format!("{}-preview", photo.fingerprint))
-                            {
-                                "Preview unavailable"
-                            } else {
-                                "Loading preview…"
-                            },
-                            "",
-                            c,
-                        )
-                        .into_any_element()
-                    })
+                        },
+                    )
                     .when(self.swipe_offset.abs() > 0.1, |d| {
                         let photos = self.visible(cx);
                         let neighbor = if self.swipe_offset < 0. {
@@ -5491,6 +5594,21 @@ impl PhotosApp {
     }
 }
 /// Pinching in from fit this far closes the viewer.
+/// Runs blocking source work (disk and network) on its own thread pool.
+/// GPUI's executor threads also decode every image and shape text, so a
+/// slow server holding them would stall drawing and every other load.
+/// Tests keep GPUI's deterministic executor.
+trait Offload {
+    fn offload<T: Send + 'static>(&self, work: impl FnOnce() -> T + Send + 'static) -> Task<T>;
+}
+impl Offload for BackgroundExecutor {
+    fn offload<T: Send + 'static>(&self, work: impl FnOnce() -> T + Send + 'static) -> Task<T> {
+        #[cfg(test)]
+        return self.spawn(async move { work() });
+        #[cfg(not(test))]
+        self.spawn(blocking::unblock(work))
+    }
+}
 const DISMISS_TRIGGER: f32 = 0.97;
 struct ClosingPhoto {
     image: Arc<RenderImage>,
@@ -5808,14 +5926,12 @@ impl Render for PhotosApp {
                             .border_b_1()
                             .border_color(rgb(c.border))
                             .child(
-                                div().flex_1().min_w_0().max_w(px(300.)).child(
-                                    field(
-                                        Input::new(&self.search)
-                                            .prefix(kit::glyph("search", 14., c.muted))
-                                            .cleanable(true),
-                                        c,
-                                    ),
-                                ),
+                                div().flex_1().min_w_0().max_w(px(300.)).child(field(
+                                    Input::new(&self.search)
+                                        .prefix(kit::glyph("search", 14., c.muted))
+                                        .cleanable(true),
+                                    c,
+                                )),
                             )
                             .child(div().flex_1())
                             .when(available >= 500., |d| {
@@ -6000,12 +6116,31 @@ impl Render for PhotosApp {
                     .children(inspector),
             );
         }
+        let origin_entity = cx.entity();
+        root = root.child(
+            canvas(
+                move |bounds, _, cx| {
+                    origin_entity.update(cx, |this, cx| {
+                        if this.overlay_origin != bounds.origin {
+                            this.overlay_origin = bounds.origin;
+                            cx.notify();
+                        }
+                    })
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0(),
+        );
+        let origin = self.overlay_origin;
         if let Some(m) = &self.marquee {
             root = root.child(
                 div()
+                    .id("marquee")
+                    .debug_selector(|| "marquee".into())
                     .absolute()
-                    .left(m.start.x.min(m.end.x))
-                    .top(m.start.y.min(m.end.y))
+                    .left(m.start.x.min(m.end.x) - origin.x)
+                    .top(m.start.y.min(m.end.y) - origin.y)
                     .w((m.end.x - m.start.x).abs())
                     .h((m.end.y - m.start.y).abs())
                     .border_1()
@@ -6014,8 +6149,11 @@ impl Render for PhotosApp {
             );
         }
         if let Some(closing) = &self.closing {
-            let from = closing.bounds;
-            let target = closing.target.flatten();
+            let from = Bounds::new(closing.bounds.origin - origin, closing.bounds.size);
+            let target = closing
+                .target
+                .flatten()
+                .map(|(to, radius)| (Bounds::new(to.origin - origin, to.size), radius));
             root = root.child(
                 div()
                     .id("closing-photo")
@@ -6058,7 +6196,7 @@ impl Render for PhotosApp {
             );
         }
         if let Some(at) = self.menu {
-            root = root.child(self.menu_view(at, w, c, cx));
+            root = root.child(self.menu_view(at - origin, w, c, cx));
         }
         if let Some(modal) = self.modal {
             root = root.child(self.modal_view(modal, w, c, cx));

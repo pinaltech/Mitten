@@ -142,6 +142,9 @@ pub struct Photo {
     pub fingerprint: String,
     /// Length of a video in seconds; `None` for still photos.
     pub duration: Option<f32>,
+    /// A ThumbHash from the source (a few dozen bytes), drawn blurred while
+    /// the real thumbnail loads.
+    pub placeholder: Option<Arc<[u8]>>,
 }
 #[derive(Clone, Debug, Default)]
 pub struct Library {
@@ -389,6 +392,11 @@ pub trait PhotosDriver: Send + Sync {
     fn sample(&self, _photo: &Photo, _edge: u32) -> Result<()> {
         bail!("This source cannot be measured")
     }
+    /// The edge this source actually renders when asked for `edge` (see
+    /// [`crate::sources::Provider::rendition`]).
+    fn rendition(&self, edge: u32) -> u32 {
+        edge
+    }
     /// Capture details for the info panel.
     fn details(&self, _photo: &Photo) -> Result<PhotoDetails> {
         Ok(PhotoDetails::default())
@@ -449,8 +457,23 @@ pub fn measure_sizes(
         driver.sample(samples.get(i)?, edge).ok()?;
         Some(started.elapsed())
     };
-    sizes.grid = fastest_reasonable(&ImageSizes::GRID, samples.len(), GRID_BUDGET, &mut time);
-    sizes.viewer = fastest_reasonable(&ImageSizes::VIEWER, samples.len(), VIEWER_BUDGET, &mut time);
+    // Sizes the source serves as one rendition are timed once, as the
+    // largest of them: measuring the same download again proves nothing.
+    let distinct = |candidates: &[u32]| {
+        let mut out: Vec<u32> = vec![];
+        for &edge in candidates {
+            let effective = driver.rendition(edge);
+            match out.last_mut() {
+                Some(last) if driver.rendition(*last) == effective => *last = edge,
+                _ => out.push(edge),
+            }
+        }
+        out
+    };
+    let grid = distinct(&ImageSizes::GRID);
+    let viewer = distinct(&ImageSizes::VIEWER);
+    sizes.grid = fastest_reasonable(&grid, samples.len(), GRID_BUDGET, &mut time);
+    sizes.viewer = fastest_reasonable(&viewer, samples.len(), VIEWER_BUDGET, &mut time);
     sizes
 }
 
@@ -780,6 +803,7 @@ impl PhotosDriver for LocalPhotos {
                 fingerprint,
                 id,
                 duration,
+                placeholder: None,
             }));
         }
         photos.sort_by(|a, b| b.modified.cmp(&a.modified).then(a.id.cmp(&b.id)));

@@ -19,6 +19,7 @@ required-features = ["native-ui"]
 
 [dependencies]
 anyhow = "1"
+blocking = "1.7"
 chrono = { version = "0.4", features = ["serde"] }
 desert-ui = { path = "../DesertUI", version = "0.1.0", optional = true }
 directories = "6"

@@ -24,7 +24,7 @@ impl PhotosApp {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move {
+                .offload(move || {
                     let people = driver.people();
                     let places = driver.places();
                     (people, places)
@@ -68,7 +68,7 @@ impl PhotosApp {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { driver.matching(&query) })
+                .offload(move || driver.matching(&query))
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.query_pending.as_ref() != Some(&filter) {
@@ -114,7 +114,7 @@ impl PhotosApp {
             let query = text.clone();
             let result = cx
                 .background_executor()
-                .spawn(async move { driver.search(&query) })
+                .offload(move || driver.search(&query))
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.search_epoch != epoch {
@@ -142,7 +142,7 @@ impl PhotosApp {
         cx.spawn_in(w, async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { driver.video_file(&photo) })
+                .offload(move || driver.video_file(&photo))
                 .await;
             let _ = this.update(cx, |this, cx| {
                 match result {
@@ -177,6 +177,7 @@ impl PhotosApp {
                     caption: String::new(),
                     fingerprint: format!("place-{}", place.photo),
                     duration: None,
+                    placeholder: None,
                 })
             })
     }

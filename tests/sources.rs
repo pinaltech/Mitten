@@ -37,6 +37,7 @@ impl Provider for MillionPhotos {
                     caption: String::new(),
                     fingerprint: format!("asset-{i}-v1"),
                     duration: None,
+                    placeholder: None,
                 })
             })
             .collect();
@@ -585,6 +586,7 @@ mod remote {
                 caption: String::new(),
                 fingerprint: String::new(),
                 duration: None,
+                placeholder: None,
             };
             let dir = tempfile::tempdir().unwrap();
             assert!(
@@ -664,6 +666,7 @@ impl Provider for AlbumSource {
                     caption: String::new(),
                     fingerprint: format!("asset-{i}"),
                     duration: (i == 2).then_some(12.5),
+                    placeholder: None,
                 })
             })
             .collect();

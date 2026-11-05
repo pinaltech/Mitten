@@ -33,6 +33,7 @@ fn missing_usage_description_is_reported_before_requesting_photos_access() {
         caption: String::new(),
         fingerprint: "fixture".into(),
         duration: None,
+        placeholder: None,
     };
     for result in [driver.thumbnail(&photo), driver.preview(&photo)] {
         assert!(

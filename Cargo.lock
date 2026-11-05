@@ -1392,6 +1392,7 @@ name = "desert-photos"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blocking",
  "chrono",
  "desert-ui",
  "directories",

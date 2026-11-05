@@ -70,6 +70,7 @@ impl Provider for ApplePhotos {
                     deleted: false,
                     caption: String::new(),
                     duration: a["duration"].as_f64().map(|d| d as f32),
+                    placeholder: None,
                 }))
             })
             .collect::<Result<Vec<_>>>()?;
