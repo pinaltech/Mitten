@@ -433,7 +433,7 @@ impl PhotosApp {
                 d.child(setting(
                     "Tile address",
                     "A raster tile URL with {z}, {x} and {y}. Press Return to use it.",
-                    Input::new(&self.map_url),
+                    super::field(Input::new(&self.map_url), c),
                     c,
                 ))
             })

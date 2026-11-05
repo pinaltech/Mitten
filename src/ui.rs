@@ -768,16 +768,8 @@ impl PhotosApp {
         {
             let weak = cx.weak_entity();
             w.on_window_should_close(cx, move |_, cx| {
-                weak.update(cx, |this, cx| {
-                    if this.busy {
-                        this.error = Some("Operation in progress. Wait before closing.".into());
-                        cx.notify();
-                        false
-                    } else {
-                        true
-                    }
-                })
-                .unwrap_or(true)
+                weak.update(cx, |this, cx| this.allow_close(cx))
+                    .unwrap_or(true)
             });
         }
         if let Some(path) = this.preferences.active.clone() {
@@ -870,6 +862,18 @@ impl PhotosApp {
             .find(|a| a.key() == self.preferences.accent)
             .unwrap_or(Accent::Orange)
     }
+    /// Closing the window ends the app, so refuse while an operation is in
+    /// flight and say why. Shared by the compositor's close request and the
+    /// client-side titlebar's close button.
+    fn allow_close(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.busy {
+            self.error = Some("Operation in progress. Wait before closing.".into());
+            cx.notify();
+            false
+        } else {
+            true
+        }
+    }
     fn theme(&self, w: &mut Window, cx: &mut Context<Self>) {
         let dark = match self.preferences.appearance.as_str() {
             "dark" => true,
@@ -895,6 +899,13 @@ impl PhotosApp {
         theme.colors.input = rgb(c.border).into();
         theme.colors.muted_foreground = rgb(c.muted).into();
         theme.colors.border = rgb(c.border).into();
+        // The app root draws its own rounded window outline and background
+        // (`window_frame`); `Root`'s square fill would show past its corners.
+        // Text fields set their background through `field`.
+        theme.colors.window_border = transparent_black();
+        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+            theme.colors.background = transparent_black();
+        }
         cx.notify();
     }
     fn set_accent(&mut self, accent: Accent, w: &mut Window, cx: &mut Context<Self>) {
@@ -2601,13 +2612,14 @@ impl PhotosApp {
             )
             .child(menu.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()))
     }
-    fn sidebar_view(&self, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
+    fn sidebar_view(&self, c: Colors, corner: Pixels, cx: &mut Context<Self>) -> impl IntoElement {
         let mut side = ui::sidebar(c)
             .id("photos-sidebar")
             .debug_selector(|| "photos-sidebar".into())
             .w(px(216.))
             .p_2()
             .bg(rgb(c.bg))
+            .rounded_bl(corner)
             .child(self.library_switcher(c, cx))
             .child(
                 kit::nav_item(
@@ -4961,21 +4973,21 @@ impl PhotosApp {
                     "Browse your library. Albums, favorites and captions are saved on this device.",
                 ))
                 .child(div().text_size(px(12.)).child("Server address"))
-                .child(Input::new(&self.server));
+                .child(field(Input::new(&self.server), c));
             if provider == ProviderKind::Nextcloud {
                 content = content
                     .child(div().text_size(px(12.)).child("Username"))
-                    .child(Input::new(&self.username));
+                    .child(field(Input::new(&self.username), c));
             }
             content = content.child(div().text_size(px(12.)).child(if provider == ProviderKind::Immich { "API key" } else { "App password" }))
-                .child(Input::new(&self.secret))
+                .child(field(Input::new(&self.secret), c))
                 .child(div().text_size(px(11.)).text_color(rgb(c.muted)).child(if provider == ProviderKind::Immich {
                     "Create an API key in Immich account settings with asset read, view and download permissions."
                 } else { "Create an app password in Nextcloud → Personal settings → Security." }));
             if provider == ProviderKind::Nextcloud {
                 content = content
                     .child(div().text_size(px(12.)).child("Photo folder (optional)"))
-                    .child(Input::new(&self.remote_folder));
+                    .child(field(Input::new(&self.remote_folder), c));
             }
             return content.child(
                 ui::button("connect-photo-service", c, true, !self.busy)
@@ -5213,11 +5225,11 @@ impl PhotosApp {
                     );
             }
             Modal::Browse => {
-                content = content.child(div().h(px(340.)).child(self.sidebar_view(c, cx)));
+                content = content.child(div().h(px(340.)).child(self.sidebar_view(c, px(0.), cx)));
             }
             Modal::Album => {
                 content = content
-                    .child(Input::new(&self.name))
+                    .child(field(Input::new(&self.name), c))
                     .child(
                         div()
                             .text_size(px(12.))
@@ -5530,6 +5542,7 @@ impl Render for PhotosApp {
             .bg(rgb(c.raised))
             .text_color(rgb(c.text))
             .text_size(px(13.))
+            .map(|d| ui::window_frame(d, c, w))
             .child(
                 canvas(
                     |_, _, _| (),
@@ -5715,7 +5728,12 @@ impl Render for PhotosApp {
                         cx.listener(|this, _, w, cx| this.open_modal(Modal::Sources, w, cx)),
                     ),
                 );
-        root = root.child(bar);
+        let close = cx.listener(|this, _: &ClickEvent, w, cx| {
+            if this.allow_close(cx) {
+                w.remove_window();
+            }
+        });
+        root = root.child(ui::client_titlebar(bar, c, close, w, cx));
         if let Some(error) = &self.error {
             root = root.child(
                 div()
@@ -5791,9 +5809,12 @@ impl Render for PhotosApp {
                             .border_color(rgb(c.border))
                             .child(
                                 div().flex_1().min_w_0().max_w(px(300.)).child(
-                                    Input::new(&self.search)
-                                        .prefix(kit::glyph("search", 14., c.muted))
-                                        .cleanable(true),
+                                    field(
+                                        Input::new(&self.search)
+                                            .prefix(kit::glyph("search", 14., c.muted))
+                                            .cleanable(true),
+                                        c,
+                                    ),
                                 ),
                             )
                             .child(div().flex_1())
@@ -5972,7 +5993,9 @@ impl Render for PhotosApp {
                     .min_h_0()
                     .min_w_0()
                     .flex()
-                    .when(show_sidebar, |d| d.child(self.sidebar_view(c, cx)))
+                    .when(show_sidebar, |d| {
+                        d.child(self.sidebar_view(c, ui::window_corners(w).bottom_left, cx))
+                    })
                     .child(main)
                     .children(inspector),
             );
@@ -6081,6 +6104,12 @@ fn register_shortcuts(cx: &mut App) {
     ]);
 }
 
+/// Give a text field the window background explicitly: the theme's
+/// background is transparent on Linux so `Root` doesn't paint past the
+/// rounded window corners, and inputs would otherwise inherit that.
+pub(crate) fn field(input: Input, c: Colors) -> Input {
+    input.bg(rgb(c.bg))
+}
 pub fn run() -> anyhow::Result<()> {
     let project = directories::ProjectDirs::from("com", "pinal", "DesertPhotos")
         .ok_or_else(|| anyhow::anyhow!("Cannot locate application data"))?;
@@ -6141,6 +6170,10 @@ pub fn run() -> anyhow::Result<()> {
                         appears_transparent: cfg!(target_os = "macos"),
                         ..Default::default()
                     }),
+                    // Draw the titlebar ourselves on Linux so the topbar is the
+                    // window's titlebar (GNOME never offers server decorations).
+                    window_decorations: cfg!(target_os = "linux")
+                        .then_some(WindowDecorations::Client),
                     ..Default::default()
                 },
                 |w, cx| {
