@@ -37,7 +37,7 @@ pub(super) fn should_handoff(w: &Window, at: Point<Pixels>) -> bool {
 
 #[cfg(target_os = "macos")]
 fn records(photos: &[Arc<Photo>], previews: Vec<Option<PathBuf>>) -> Option<std::ffi::CString> {
-    let names = desert_photos::drag_export::filenames(photos.iter().map(|p| p.name.as_str()));
+    let names = mitten::drag_export::filenames(photos.iter().map(|p| p.name.as_str()));
     let items: Vec<_> = photos
         .iter()
         .zip(names)
@@ -192,7 +192,7 @@ extern "C" fn write(
             .photos
             .get(index)
             .ok_or_else(|| anyhow::anyhow!("Photo missing from drag"))?;
-        desert_photos::drag_export::write_original(context.driver.as_ref(), &photo.id, destination)
+        mitten::drag_export::write_original(context.driver.as_ref(), &photo.id, destination)
     }));
     let message = match result {
         Ok(Ok(())) => return true,

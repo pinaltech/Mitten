@@ -92,7 +92,7 @@ without a window:
   around the position (or scales the nearest past them), and a `Layer` places
   one level's photos into it, or scales a date grid whole.
 
-In the app, `PhotosApp::zoom_library` is the single entry for every input,
+In the app, `MittenApp::zoom_library` is the single entry for every input,
 `transition_view` paints the shown levels' layers over the real grid (each in
 a single draw order, faded as a whole), and `finish_zoom` commits a level as
 the real grid once the size has landed and its photos are in.

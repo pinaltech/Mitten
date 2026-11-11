@@ -73,7 +73,7 @@
   end-to-end receiver operation. The user then quit/reopened the rebuilt bundle
   and confirmed that a real Finder drop creates the file. Automated cross-app
   release remains unreliable; live PhotoKit/Immich/Nextcloud drag drops were not
-  exercised. See [DRAG_EXPORT.md](docs/DRAG_EXPORT.md).
+  exercised. See [DRAG_EXPORT.md](DRAG_EXPORT.md).
 - Zoom is constrained to 100–800%. Zooming/pinching out from fit closes the viewer;
   downward scrolling from fit also closes it. Typed percentages below 100 clamp
   to fit. Tests cover stopping at fit when zooming down from above it, closing
@@ -122,7 +122,7 @@
   stopped after verification. Physical pinch feel and exact
   equivalence to Apple's Photos remain unverified. Research, design reasoning
   and the distinction from Apple's private implementation are documented in
-  [GALLERY_TRANSITIONS.md](docs/GALLERY_TRANSITIONS.md).
+  [GALLERY_TRANSITIONS.md](GALLERY_TRANSITIONS.md).
 - One full run exposed an intermittent truncated localhost HTTP response in the
   test fixture. Accepted fixture connections now explicitly use blocking I/O,
   and write failures are asserted. All eight source/protocol tests then passed
@@ -186,9 +186,9 @@ are historical and superseded by this revision.
 ## Appearance, catalog and gallery batch — October 31, 2026
 
 Before implementation, the production data directory at
-`~/Library/Application Support/com.pinal.DesertPhotos/` was reset. No saved remote
+`~/Library/Application Support/tech.pinal.mitten/` was reset. No saved remote
 credentials were present to remove. Original libraries were preserved. A Git
-repository was initialized in `GPUI Photos` and the baseline committed as
+repository was initialized in this folder and the baseline committed as
 `f993866` before the batch. The production profile was checked again after all
 verification and remains empty; all tests and desktop review used other profiles.
 
@@ -269,7 +269,7 @@ data; no personal photo library or real server account was connected.
   eight source/protocol tests, and ten existing storage tests. Formatting and
   strict all-target Clippy (`-D warnings`) pass.
 - Full native macOS debug compilation and `scripts/bundle-macos.sh` succeed.
-  `target/GPUI Photos.app` contains the new binary and Photos permission text.
+  `target/Mitten.app` contains the new binary and Photos permission text.
   Both Info.plists pass `plutil`; the binary links Photos.framework. The small
   PhotoKit bridge compiles with ARC, blocks, and `-Wall -Wextra -Werror`.
 - Platform compile checks pass for the **core plus remote adapters** on
@@ -375,7 +375,7 @@ October 31, 2026, Apple Silicon macOS, Rust 1.96.0.
 - Locked offline tests: **12 pass** (10 storage, 2 real GPUI interaction/layout).
 - Strict all-target Clippy passes with `-D warnings`.
 - Native debug build and `scripts/bundle-macos.sh` succeed. The launchable app is
-  `target/GPUI Photos.app`.
+  `target/Mitten.app`.
 - DesertUI's 3 existing tests pass; Picacho and the Ironwood workspace also
   compile against the updated crate.
 

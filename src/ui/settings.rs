@@ -1,7 +1,7 @@
 //! Settings pages: Appearance and Behavior (browsing, image sizes, maps),
 //! laid out like the mail client's settings.
 use super::*;
-use desert_photos::loading::{self, ImageSizes};
+use mitten::loading::{self, ImageSizes};
 use std::rc::Rc;
 
 /// A small uppercase section title with a rule beneath it.
@@ -77,8 +77,8 @@ pub(super) fn toggle_setting(
         )
         .child(control)
 }
-type OnPick<T> = Rc<dyn Fn(&mut PhotosApp, T, &mut Window, &mut Context<PhotosApp>)>;
-impl PhotosApp {
+type OnPick<T> = Rc<dyn Fn(&mut MittenApp, T, &mut Window, &mut Context<MittenApp>)>;
+impl MittenApp {
     /// A segmented control: one rounded track, the active option raised.
     /// `dimmed` shows the choice without implying it is in force.
     pub(super) fn segmented<T: Copy + 'static>(

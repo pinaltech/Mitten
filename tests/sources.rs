@@ -1,5 +1,5 @@
 use anyhow::Result;
-use desert_photos::{
+use mitten::{
     loading::PAGE_SIZE,
     sources::{ConnectedPhotos, Connection, PhotoPage, Provider},
     storage::{Library, Photo, PhotosDriver, Source},
@@ -197,7 +197,7 @@ fn connection_validation_and_credential_free_settings() {
 #[cfg(feature = "remote")]
 mod remote {
     use super::*;
-    use desert_photos::sources::remote::{Remote, parse_nextcloud, search_body};
+    use mitten::sources::remote::{Remote, parse_nextcloud, search_body};
     use serde_json::json;
     use std::{
         io::{BufRead, Read, Write},
@@ -625,16 +625,14 @@ fn promised_connected_originals_are_fetched_only_on_fulfillment() {
     .unwrap();
     let photos = driver.page(None).unwrap().library.photos;
     assert!(photos[0].path.as_os_str().is_empty());
-    let names = desert_photos::drag_export::filenames(photos[..2].iter().map(|p| p.name.as_str()));
+    let names = mitten::drag_export::filenames(photos[..2].iter().map(|p| p.name.as_str()));
     assert_eq!(names.len(), 2);
     assert_eq!(originals.load(Ordering::SeqCst), 0);
     let destination = receiver.path().join("Receiver's renamed file.png");
-    desert_photos::drag_export::write_original(&driver, &photos[0].id, &destination).unwrap();
+    mitten::drag_export::write_original(&driver, &photos[0].id, &destination).unwrap();
     assert_eq!(originals.load(Ordering::SeqCst), 1);
     assert_eq!(fs::read(&destination).unwrap(), b"original bytes");
-    assert!(
-        desert_photos::drag_export::write_original(&driver, &photos[0].id, &destination).is_err()
-    );
+    assert!(mitten::drag_export::write_original(&driver, &photos[0].id, &destination).is_err());
     assert_eq!(
         originals.load(Ordering::SeqCst),
         1,

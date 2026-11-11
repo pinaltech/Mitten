@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="540" viewBox="0 0 640 540" role="img" aria-labelledby="logo-title logo-desc">
+<title id="logo-title">Mitten Butte Lens</title>
+<desc id="logo-desc">A green West Mitten Butte silhouette with a negative-space camera lens ring, separated by negative space from a dark teal rising horizon.</desc>
+<defs>
+      <linearGradient id="peak-gradient" x1="40" y1="60" x2="600" y2="400" gradientUnits="userSpaceOnUse">
+        <stop offset="0" stop-color="#35CD58"/>
+        <stop offset="0.55" stop-color="#18B965"/>
+        <stop offset="1" stop-color="#008D77"/>
+      </linearGradient>
+      <linearGradient id="base-gradient" x1="0" y1="0" x2="1" y2="0" gradientUnits="objectBoundingBox">
+        <stop offset="0" stop-color="#003D40"/>
+        <stop offset="1" stop-color="#005353"/>
+      </linearGradient>
+    </defs>
+<path id="peak" fill="url(#peak-gradient)" fill-rule="evenodd" d="
+        M 40 396 L 40 352 L 192 240
+        L 198 120 Q 199 106 213 105 L 294 96 L 362 102 Q 375 103 376 116
+        L 380 200 Q 381 210 391 210 L 403 210 Q 413 210 414 200
+        L 417 138 Q 418 124 431 124 L 439 124 Q 452 124 453 138
+        L 460 240 L 600 352 L 600 396
+        Q 600 403 592 397 C 550 362 493 339 432 327 Q 320 306 208 327 C 147 339 90 362 48 397 Q 40 403 40 396 Z
+        M 227 188 a 60 60 0 1 0 120 0 a 60 60 0 1 0 -120 0 Z
+        M 253 188 a 34 34 0 1 0 68 0 a 34 34 0 1 0 -68 0 Z"/>
+      <path id="lower-horizon" d="M 40 500 A 280 142 0 0 1 600 500 L 40 500 Z" fill="url(#base-gradient)"/>
+</svg>

@@ -2,7 +2,7 @@
 #import <objc/runtime.h>
 #include <stdlib.h>
 #include <stdio.h>
-static void DPTrace(const char *message) { if (getenv("DESERT_PHOTOS_TRACE_DRAGS")) fprintf(stderr,"Photos drag: %s\n",message); }
+static void DPTrace(const char *message) { if (getenv("MITTEN_TRACE_DRAGS")) fprintf(stderr,"Photos drag: %s\n",message); }
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <ImageIO/ImageIO.h>
 
@@ -108,7 +108,7 @@ static NSData *DPConvertImage(NSString *path, NSString *type) {
         @synchronized(self.context) {
             if (!self.context.temporaryDirectory)
                 self.context.temporaryDirectory = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                    [@"DesertPhotos-" stringByAppendingString:NSUUID.UUID.UUIDString]];
+                    [@"Mitten-" stringByAppendingString:NSUUID.UUID.UUIDString]];
             root = self.context.temporaryDirectory;
         }
         NSString *folder = [root stringByAppendingPathComponent:[NSString stringWithFormat:@"%lu", (unsigned long)self.index]];
@@ -191,7 +191,7 @@ static NSData *DPConvertImage(NSString *path, NSString *type) {
     char error[4096] = {0};
     if (!self.context.write(self.context.rust, self.index, url.fileSystemRepresentation, error, sizeof(error))) {
         NSString *message = [NSString stringWithUTF8String:error] ?: @"Cannot export the original photo.";
-        writeError = [NSError errorWithDomain:@"com.pinal.DesertPhotos.Drag" code:1
+        writeError = [NSError errorWithDomain:@"tech.pinal.mitten.Drag" code:1
             userInfo:@{NSLocalizedDescriptionKey: message}];
     }
     DPTrace(writeError ? "original fulfillment failed" : "original delivered");
@@ -263,7 +263,7 @@ bool dp_copy_photos(const char *json, void *rustContext, DPWriteOriginal write, 
         [pasteboard clearContents];
         return [pasteboard writeObjects:DPPhotoItems(context, records)];
     } @catch (NSException *exception) {
-        if (getenv("DESERT_PHOTOS_TRACE_DRAGS")) NSLog(@"Photos copy exception: %@", exception.reason);
+        if (getenv("MITTEN_TRACE_DRAGS")) NSLog(@"Photos copy exception: %@", exception.reason);
         return false;
     }
 }
@@ -390,7 +390,7 @@ bool dp_start_original_drag(void *nsView, const char *json, void *rustContext,
         DPTrace("native session started");
         return true;
     } @catch (NSException *exception) {
-        if (getenv("DESERT_PHOTOS_TRACE_DRAGS")) NSLog(@"Photos drag exception: %@",exception.reason);
+        if (getenv("MITTEN_TRACE_DRAGS")) NSLog(@"Photos drag exception: %@",exception.reason);
         return false;
     }
 }

@@ -1388,35 +1388,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "desert-photos"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blocking",
- "chrono",
- "desert-ui",
- "directories",
- "gpui",
- "gpui-component",
- "image",
- "kamadak-exif",
- "keyring",
- "raw-window-handle",
- "reqwest",
- "reqwest_dav",
- "roxmltree 0.21.2",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "desert-ui"
 version = "0.1.0"
+source = "git+https://github.com/pinaltech/DesertUI?branch=main#334a70e710ebad6d383b045b29f65bd601ea3b58"
 dependencies = [
  "cocoa 0.26.0",
  "gpui",
@@ -3421,9 +3395,9 @@ checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libfuzzer-sys"
@@ -3778,6 +3752,33 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mitten"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blocking",
+ "chrono",
+ "desert-ui",
+ "directories",
+ "gpui",
+ "gpui-component",
+ "image",
+ "kamadak-exif",
+ "keyring",
+ "raw-window-handle",
+ "reqwest",
+ "reqwest_dav",
+ "roxmltree 0.21.2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "url",
+ "uuid",
 ]
 
 [[package]]

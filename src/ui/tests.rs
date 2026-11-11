@@ -1,10 +1,10 @@
 use super::*;
-use desert_photos::gallery::zoom::{FADE, Phase};
+use mitten::gallery::zoom::{FADE, Phase};
 use std::prelude::v1::test;
 
 /// A trackpad pinch that moves the zoom by exactly `levels` ladder slots,
 /// then lifts the fingers if `ended`.
-fn pinch(app: &mut PhotosApp, levels: f32, ended: bool, cx: &mut Context<PhotosApp>) {
+fn pinch(app: &mut MittenApp, levels: f32, ended: bool, cx: &mut Context<MittenApp>) {
     let (ladder, position) = match &app.gallery_zoom {
         Some(z) => (z.ladder.clone(), z.zoom.position),
         None => {
@@ -19,7 +19,7 @@ fn pinch(app: &mut PhotosApp, levels: f32, ended: bool, cx: &mut Context<PhotosA
         app.zoom_library(ZoomInput::Release, true, cx);
     }
 }
-fn zoom_state(app: &PhotosApp) -> &Zoom {
+fn zoom_state(app: &MittenApp) -> &Zoom {
     &app.gallery_zoom.as_ref().unwrap().zoom
 }
 
@@ -75,7 +75,7 @@ fn grid_selection_viewer_and_library_controls_work_at_multiple_window_sizes(
     let mut entity = None;
     let window = cx.add_window(|w, cx| {
         let v = cx.new(|cx| {
-            let mut app = PhotosApp::new(directory.path().join("settings.json"), w, cx);
+            let mut app = MittenApp::new(directory.path().join("settings.json"), w, cx);
             app.preferences.bottom_to_top = false;
             app.driver = Some(driver.clone());
             app.library = driver.scan().unwrap();
@@ -180,7 +180,7 @@ fn onboarding_exposes_service_logos_and_connection_forms(cx: &mut TestAppContext
     let directory = tempfile::tempdir().unwrap();
     let mut entity = None;
     let window = cx.add_window(|w, cx| {
-        let v = cx.new(|cx| PhotosApp::new(directory.path().join("settings.json"), w, cx));
+        let v = cx.new(|cx| MittenApp::new(directory.path().join("settings.json"), w, cx));
         entity = Some(v.clone());
         Root::new(v, w, cx)
     });
@@ -251,7 +251,7 @@ fn blank_click_marquee_viewer_zoom_delete_confirmation_and_album_spaces(cx: &mut
     let mut entity = None;
     let window = cx.add_window(|w, cx| {
         let view = cx.new(|cx| {
-            let mut app = PhotosApp::new(directory.path().join("profile/settings.json"), w, cx);
+            let mut app = MittenApp::new(directory.path().join("profile/settings.json"), w, cx);
             app.preferences.bottom_to_top = false;
             app.driver = Some(driver.clone());
             app.library = driver.scan().unwrap();
@@ -418,7 +418,7 @@ fn synthetic_photos(range: std::ops::Range<usize>) -> Vec<Arc<Photo>> {
         })
         .collect()
 }
-impl desert_photos::sources::Provider for StressSource {
+impl mitten::sources::Provider for StressSource {
     fn page(&self, cursor: Option<&str>) -> anyhow::Result<PhotoPage> {
         use std::sync::atomic::Ordering::SeqCst;
         self.0.pages.fetch_add(1, SeqCst);
@@ -468,7 +468,7 @@ fn scrolling_a_million_photo_grid_only_loads_visible_thumbnails(cx: &mut TestApp
     let directory = tempfile::tempdir().unwrap();
     let counters = Arc::new(SourceCounters::default());
     let driver: Arc<dyn PhotosDriver> = Arc::new(
-        desert_photos::sources::ConnectedPhotos::new(
+        mitten::sources::ConnectedPhotos::new(
             Source {
                 driver: "synthetic".into(),
                 path: directory.path().join("source"),
@@ -481,7 +481,7 @@ fn scrolling_a_million_photo_grid_only_loads_visible_thumbnails(cx: &mut TestApp
     let start = std::time::Instant::now();
     let window = cx.add_window(|w, cx| {
         let view = cx.new(|cx| {
-            let mut app = PhotosApp::new(directory.path().join("settings.json"), w, cx);
+            let mut app = MittenApp::new(directory.path().join("settings.json"), w, cx);
             app.driver = Some(driver);
             app.library.photos = synthetic_photos(0..1_000_000);
             app.library_changed();
@@ -560,7 +560,7 @@ fn scroll_pages_retry_and_request_limits_are_enforced(cx: &mut TestAppContext) {
     let directory = tempfile::tempdir().unwrap();
     let counters = Arc::new(SourceCounters::default());
     let driver: Arc<dyn PhotosDriver> = Arc::new(
-        desert_photos::sources::ConnectedPhotos::new(
+        mitten::sources::ConnectedPhotos::new(
             Source {
                 driver: "synthetic".into(),
                 path: directory.path().join("source"),
@@ -575,7 +575,7 @@ fn scroll_pages_retry_and_request_limits_are_enforced(cx: &mut TestAppContext) {
     let mut entity = None;
     let window = cx.add_window(|w, cx| {
         let view = cx.new(|cx| {
-            let mut app = PhotosApp::new(directory.path().join("settings.json"), w, cx);
+            let mut app = MittenApp::new(directory.path().join("settings.json"), w, cx);
             app.finish_connection(Ok((driver.clone(), first)), w, cx);
             app
         });
@@ -643,7 +643,7 @@ fn accent_settings_removal_gapless_gallery_and_side_navigation(cx: &mut TestAppC
     let mut entity = None;
     let window = cx.add_window(|w, cx| {
         let app = cx.new(|cx| {
-            let mut app = PhotosApp::new(data.path().join("profile/settings.json"), w, cx);
+            let mut app = MittenApp::new(data.path().join("profile/settings.json"), w, cx);
             let page = driver.page(None).unwrap();
             app.finish_connection(Ok((driver.clone(), page)), w, cx);
             app
@@ -780,7 +780,7 @@ fn million_photo_catalog_finishes_automatically_without_fetching_offscreen_image
     let data = tempfile::tempdir().unwrap();
     let counters = Arc::new(SourceCounters::default());
     let driver: Arc<dyn PhotosDriver> = Arc::new(
-        desert_photos::sources::ConnectedPhotos::new(
+        mitten::sources::ConnectedPhotos::new(
             Source {
                 driver: "synthetic".into(),
                 path: data.path().join("source"),
@@ -794,7 +794,7 @@ fn million_photo_catalog_finishes_automatically_without_fetching_offscreen_image
     let start = std::time::Instant::now();
     let window = cx.add_window(|w, cx| {
         let app = cx.new(|cx| {
-            let mut app = PhotosApp::new(data.path().join("profile/settings.json"), w, cx);
+            let mut app = MittenApp::new(data.path().join("profile/settings.json"), w, cx);
             app.finish_connection(Ok((driver, first)), w, cx);
             assert!(app.loading_status().is_some());
             app
@@ -838,7 +838,7 @@ fn thumbnail_remains_while_viewer_upgrade_is_not_yet_decoded(cx: &mut TestAppCon
     let mut entity = None;
     let window = cx.add_window(|w, cx| {
         let app = cx.new(|cx| {
-            let mut app = PhotosApp::new(data.path().join("profile/settings.json"), w, cx);
+            let mut app = MittenApp::new(data.path().join("profile/settings.json"), w, cx);
             app.finish_connection(Ok((driver.clone(), driver.page(None).unwrap())), w, cx);
             app
         });
@@ -891,7 +891,7 @@ fn thumbnail_remains_while_viewer_upgrade_is_not_yet_decoded(cx: &mut TestAppCon
     assert!(cx.debug_bounds("viewer-image-layers").is_some());
 }
 
-fn anchor_screen_y(app: &PhotosApp, anchor: &GalleryAnchor, cx: &App) -> f32 {
+fn anchor_screen_y(app: &MittenApp, anchor: &GalleryAnchor, cx: &App) -> f32 {
     let photos = app.visible(cx);
     let index = photos.position(app.photo_index[&anchor.id]).unwrap();
     let layout = app.gallery_layout(cx);
@@ -899,7 +899,7 @@ fn anchor_screen_y(app: &PhotosApp, anchor: &GalleryAnchor, cx: &App) -> f32 {
         + anchor.within * layout.edge
         + f32::from(app.scroll.0.borrow().base_handle.offset().y)
 }
-fn assert_at_bottom(app: &PhotosApp, cx: &App) {
+fn assert_at_bottom(app: &MittenApp, cx: &App) {
     let layout = app.gallery_layout(cx);
     let h = &app.scroll.0.borrow().base_handle;
     let max = (layout.height - f32::from(h.bounds().size.height)).max(0.);
@@ -918,7 +918,7 @@ fn bottom_first_gallery_anchors_catalog_growth_resize_filters_and_direction(
     let data = tempfile::tempdir().unwrap();
     let counters = Arc::new(SourceCounters::default());
     let driver: Arc<dyn PhotosDriver> = Arc::new(
-        desert_photos::sources::ConnectedPhotos::new(
+        mitten::sources::ConnectedPhotos::new(
             Source {
                 driver: "synthetic".into(),
                 path: data.path().join("source"),
@@ -930,7 +930,7 @@ fn bottom_first_gallery_anchors_catalog_growth_resize_filters_and_direction(
     let mut app = None;
     let window = cx.add_window(|w, cx| {
         let entity = cx.new(|cx| {
-            let mut app = PhotosApp::new(data.path().join("settings.json"), w, cx);
+            let mut app = MittenApp::new(data.path().join("settings.json"), w, cx);
             app.driver = Some(driver);
             app.library.photos = synthetic_photos(0..1003);
             app.library_changed();
@@ -1042,7 +1042,7 @@ fn viewer_swipes_settle_once_pan_only_when_zoomed_and_toolbars_frame_image(
     let mut app = None;
     let window = cx.add_window(|w, cx| {
         let entity = cx.new(|cx| {
-            let mut app = PhotosApp::new(data.path().join("profile/settings.json"), w, cx);
+            let mut app = MittenApp::new(data.path().join("profile/settings.json"), w, cx);
             app.finish_connection(Ok((driver.clone(), driver.page(None).unwrap())), w, cx);
             app
         });
@@ -1080,8 +1080,12 @@ fn viewer_swipes_settle_once_pan_only_when_zoomed_and_toolbars_frame_image(
     // Advance each frame of the timer-based settle animation.
     cx.run_until_parked();
     cx.run_until_parked();
+    // A trackpad keeps sending momentum every frame after the finger lifts.
     for _ in 0..14 {
         cx.executor().advance_clock(Duration::from_millis(16));
+        app.update_in(cx, |app, w, cx| {
+            app.viewer_swipe(-40., 0., TouchPhase::Moved, w, cx)
+        });
         cx.run_until_parked();
     }
     app.read_with(cx, |app, _| {
@@ -1147,7 +1151,7 @@ fn dense_gallery_keeps_every_visible_thumbnail_decoded_after_zoom_and_scroll(
     let data = tempfile::tempdir().unwrap();
     let counters = Arc::new(SourceCounters::default());
     let driver: Arc<dyn PhotosDriver> = Arc::new(
-        desert_photos::sources::ConnectedPhotos::new(
+        mitten::sources::ConnectedPhotos::new(
             Source {
                 driver: "synthetic".into(),
                 path: data.path().join("source"),
@@ -1159,7 +1163,7 @@ fn dense_gallery_keeps_every_visible_thumbnail_decoded_after_zoom_and_scroll(
     let mut entity = None;
     let window = cx.add_window(|w, cx| {
         let app = cx.new(|cx| {
-            let mut app = PhotosApp::new(data.path().join("settings.json"), w, cx);
+            let mut app = MittenApp::new(data.path().join("settings.json"), w, cx);
             app.driver = Some(driver);
             app.library.photos = synthetic_photos(0..3000);
             app.library_changed();
@@ -1240,7 +1244,7 @@ fn dense_gallery_keeps_every_visible_thumbnail_decoded_after_zoom_and_scroll(
     assert_eq!(counters.originals.load(SeqCst), 0);
 }
 
-fn scroll_to_row(app: &PhotosApp, row: usize, cx: &App) {
+fn scroll_to_row(app: &MittenApp, row: usize, cx: &App) {
     let layout = app.gallery_layout(cx);
     app.set_gallery_offset(row as f32 * layout.pitch);
 }
@@ -1250,7 +1254,7 @@ fn command_scroll_zooms_without_scrolling_and_chains_wheel_notches(cx: &mut Test
     cx.update(ui::init);
     let data = tempfile::tempdir().unwrap();
     let driver: Arc<dyn PhotosDriver> = Arc::new(
-        desert_photos::sources::ConnectedPhotos::new(
+        mitten::sources::ConnectedPhotos::new(
             Source {
                 driver: "synthetic".into(),
                 path: data.path().join("source"),
@@ -1262,7 +1266,7 @@ fn command_scroll_zooms_without_scrolling_and_chains_wheel_notches(cx: &mut Test
     let mut entity = None;
     let window = cx.add_window(|w, cx| {
         let app = cx.new(|cx| {
-            let mut app = PhotosApp::new(data.path().join("settings.json"), w, cx);
+            let mut app = MittenApp::new(data.path().join("settings.json"), w, cx);
             app.driver = Some(driver);
             app.library.photos = synthetic_photos(0..2000);
             app.library_changed();
@@ -1401,7 +1405,7 @@ fn zoomed_out_tiers_group_months_then_years_and_click_through_painted_tiles(
     cx.update(ui::init);
     let data = tempfile::tempdir().unwrap();
     let driver: Arc<dyn PhotosDriver> = Arc::new(
-        desert_photos::sources::ConnectedPhotos::new(
+        mitten::sources::ConnectedPhotos::new(
             Source {
                 driver: "synthetic".into(),
                 path: data.path().join("source"),
@@ -1424,7 +1428,7 @@ fn zoomed_out_tiers_group_months_then_years_and_click_through_painted_tiles(
     let mut entity = None;
     let window = cx.add_window(|w, cx| {
         let app = cx.new(|cx| {
-            let mut app = PhotosApp::new(data.path().join("settings.json"), w, cx);
+            let mut app = MittenApp::new(data.path().join("settings.json"), w, cx);
             app.driver = Some(driver);
             app.library.photos = photos;
             app.library_changed();
@@ -1495,7 +1499,7 @@ fn five_thousand_painted_tiles_scroll_and_zoom_without_per_tile_cost(cx: &mut Te
     let data = tempfile::tempdir().unwrap();
     let counters = Arc::new(SourceCounters::default());
     let driver: Arc<dyn PhotosDriver> = Arc::new(
-        desert_photos::sources::ConnectedPhotos::new(
+        mitten::sources::ConnectedPhotos::new(
             Source {
                 driver: "synthetic".into(),
                 path: data.path().join("source"),
@@ -1507,7 +1511,7 @@ fn five_thousand_painted_tiles_scroll_and_zoom_without_per_tile_cost(cx: &mut Te
     let mut entity = None;
     let window = cx.add_window(|w, cx| {
         let app = cx.new(|cx| {
-            let mut app = PhotosApp::new(data.path().join("settings.json"), w, cx);
+            let mut app = MittenApp::new(data.path().join("settings.json"), w, cx);
             app.driver = Some(driver);
             app.library.photos = synthetic_photos(0..60_000);
             app.library_changed();
@@ -1604,7 +1608,7 @@ fn advance_gallery_animation(cx: &mut VisualTestContext) {
     frame(cx);
 }
 
-fn assert_dense_ready(app: &PhotosApp, cx: &App) {
+fn assert_dense_ready(app: &MittenApp, cx: &App) {
     let view = app.visible(cx);
     let layout = app.gallery_layout(cx);
     let handle = app.scroll_handle();
@@ -1648,7 +1652,7 @@ fn final_catalog_page_keeps_latest_photo_frames_fixed_and_waits_for_pinch(cx: &m
             .total
             .store(initial + 3, std::sync::atomic::Ordering::SeqCst);
         let driver: Arc<dyn PhotosDriver> = Arc::new(
-            desert_photos::sources::ConnectedPhotos::new(
+            mitten::sources::ConnectedPhotos::new(
                 Source {
                     driver: "synthetic".into(),
                     path: data.path().join("source"),
@@ -1660,7 +1664,7 @@ fn final_catalog_page_keeps_latest_photo_frames_fixed_and_waits_for_pinch(cx: &m
         let mut entity = None;
         let window = cx.add_window(|w, cx| {
             let app = cx.new(|cx| {
-                let mut app = PhotosApp::new(data.path().join("settings.json"), w, cx);
+                let mut app = MittenApp::new(data.path().join("settings.json"), w, cx);
                 app.library.photos = synthetic_photos(0..initial);
                 app.driver = Some(driver);
                 app.total = Some(initial + 3);
@@ -1727,7 +1731,7 @@ fn viewer_stops_at_fit_and_zoom_out_returns_to_library(cx: &mut TestAppContext) 
     let mut entity = None;
     let window = cx.add_window(|w, cx| {
         let app = cx.new(|cx| {
-            let mut app = PhotosApp::new(data.path().join("profile/settings.json"), w, cx);
+            let mut app = MittenApp::new(data.path().join("profile/settings.json"), w, cx);
             app.finish_connection(Ok((driver.clone(), driver.page(None).unwrap())), w, cx);
             app
         });
@@ -1853,7 +1857,7 @@ fn viewer_exports_by_dragging_at_fit_and_keeps_dragging_for_panning_when_zoomed(
     let mut entity = None;
     let window = cx.add_window(|w, cx| {
         let app = cx.new(|cx| {
-            let mut app = PhotosApp::new(data.path().join("profile/settings.json"), w, cx);
+            let mut app = MittenApp::new(data.path().join("profile/settings.json"), w, cx);
             app.finish_connection(Ok((driver.clone(), driver.page(None).unwrap())), w, cx);
             app
         });
@@ -1914,11 +1918,11 @@ fn viewer_exports_by_dragging_at_fit_and_keeps_dragging_for_panning_when_zoomed(
 fn synthetic_app(
     cx: &mut TestAppContext,
     photos: Vec<Arc<Photo>>,
-) -> (Entity<PhotosApp>, &mut VisualTestContext, tempfile::TempDir) {
+) -> (Entity<MittenApp>, &mut VisualTestContext, tempfile::TempDir) {
     cx.update(ui::init);
     let data = tempfile::tempdir().unwrap();
     let driver: Arc<dyn PhotosDriver> = Arc::new(
-        desert_photos::sources::ConnectedPhotos::new(
+        mitten::sources::ConnectedPhotos::new(
             Source {
                 driver: "synthetic".into(),
                 path: data.path().join("source"),
@@ -1931,7 +1935,7 @@ fn synthetic_app(
     let settings = data.path().join("settings.json");
     let window = cx.add_window(|w, cx| {
         let app = cx.new(|cx| {
-            let mut app = PhotosApp::new(settings, w, cx);
+            let mut app = MittenApp::new(settings, w, cx);
             app.driver = Some(driver);
             app.library.photos = photos;
             app.library_changed();
@@ -2131,7 +2135,7 @@ fn header_dates_do_not_flicker_while_cataloging(cx: &mut TestAppContext) {
     cx.update(ui::init);
     let data = tempfile::tempdir().unwrap();
     let driver: Arc<dyn PhotosDriver> = Arc::new(
-        desert_photos::sources::ConnectedPhotos::new(
+        mitten::sources::ConnectedPhotos::new(
             Source {
                 driver: "synthetic".into(),
                 path: data.path().join("source"),
@@ -2157,7 +2161,7 @@ fn header_dates_do_not_flicker_while_cataloging(cx: &mut TestAppContext) {
     let mut app = None;
     let window = cx.add_window(|w, cx| {
         let entity = cx.new(|cx| {
-            let mut app = PhotosApp::new(data.path().join("settings.json"), w, cx);
+            let mut app = MittenApp::new(data.path().join("settings.json"), w, cx);
             app.driver = Some(driver);
             app.library.photos = dated(0..600);
             app.library_changed();
@@ -2210,7 +2214,7 @@ fn grey_thumbhash() -> Arc<[u8]> {
 
 /// Draws the app inset in its window, as Linux's client-side shadow and
 /// border do around the real window.
-struct Inset(Entity<PhotosApp>);
+struct Inset(Entity<MittenApp>);
 impl Render for Inset {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -2226,7 +2230,7 @@ fn marquee_and_closing_photo_follow_the_pointer_in_an_inset_window(cx: &mut Test
     cx.update(ui::init);
     let data = tempfile::tempdir().unwrap();
     let driver: Arc<dyn PhotosDriver> = Arc::new(
-        desert_photos::sources::ConnectedPhotos::new(
+        mitten::sources::ConnectedPhotos::new(
             Source {
                 driver: "synthetic".into(),
                 path: data.path().join("source"),
@@ -2239,7 +2243,7 @@ fn marquee_and_closing_photo_follow_the_pointer_in_an_inset_window(cx: &mut Test
     let settings = data.path().join("settings.json");
     let window = cx.add_window(|w, cx| {
         let app = cx.new(|cx| {
-            let mut app = PhotosApp::new(settings, w, cx);
+            let mut app = MittenApp::new(settings, w, cx);
             app.preferences.bottom_to_top = false;
             app.driver = Some(driver);
             app.library.photos = synthetic_photos(0..40);
@@ -2329,7 +2333,7 @@ fn catalog_keeps_paging_when_image_sizes_change_mid_page(cx: &mut TestAppContext
     let counters = Arc::new(SourceCounters::default());
     counters.total.store(1200, SeqCst);
     let driver: Arc<dyn PhotosDriver> = Arc::new(
-        desert_photos::sources::ConnectedPhotos::new(
+        mitten::sources::ConnectedPhotos::new(
             Source {
                 driver: "synthetic".into(),
                 path: directory.path().join("source"),
@@ -2342,7 +2346,7 @@ fn catalog_keeps_paging_when_image_sizes_change_mid_page(cx: &mut TestAppContext
     let mut entity = None;
     let window = cx.add_window(|w, cx| {
         let view = cx.new(|cx| {
-            let mut app = PhotosApp::new(directory.path().join("settings.json"), w, cx);
+            let mut app = MittenApp::new(directory.path().join("settings.json"), w, cx);
             app.finish_connection(Ok((driver.clone(), first)), w, cx);
             app
         });
@@ -2354,16 +2358,16 @@ fn catalog_keeps_paging_when_image_sizes_change_mid_page(cx: &mut TestAppContext
     // Automatic sizing finishes while the next catalog page is in flight.
     entity.update_in(cx, |app, w, cx| {
         assert!(app.loading, "a catalog page is in flight");
-        let before = desert_photos::loading::image_sizes();
+        let before = mitten::loading::image_sizes();
         app.preferences.automatic_sizes = false;
-        app.preferences.image_sizes = desert_photos::loading::ImageSizes {
+        app.preferences.image_sizes = mitten::loading::ImageSizes {
             viewer: if before.viewer == 1920 { 1280 } else { 1920 },
             ..before
         };
         let epoch = app.image_epoch;
         app.apply_sizes(w, cx);
         // Sizes are process-wide and other tests run alongside.
-        desert_photos::loading::set_image_sizes(before);
+        mitten::loading::set_image_sizes(before);
         assert_eq!(app.image_epoch, epoch + 1, "image jobs were invalidated");
     });
     for _ in 0..4 {
@@ -2391,7 +2395,7 @@ fn placeholders_stand_in_until_images_arrive(cx: &mut TestAppContext) {
     let counters = Arc::new(SourceCounters::default());
     counters.fail_images.store(true, SeqCst);
     let driver: Arc<dyn PhotosDriver> = Arc::new(
-        desert_photos::sources::ConnectedPhotos::new(
+        mitten::sources::ConnectedPhotos::new(
             Source {
                 driver: "synthetic".into(),
                 path: data.path().join("source"),
@@ -2403,7 +2407,7 @@ fn placeholders_stand_in_until_images_arrive(cx: &mut TestAppContext) {
     let mut entity = None;
     let window = cx.add_window(|w, cx| {
         let app = cx.new(|cx| {
-            let mut app = PhotosApp::new(data.path().join("settings.json"), w, cx);
+            let mut app = MittenApp::new(data.path().join("settings.json"), w, cx);
             app.preferences.bottom_to_top = false;
             app.driver = Some(driver);
             app.library.photos = photos.clone();

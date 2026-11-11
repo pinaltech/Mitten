@@ -1,4 +1,4 @@
-use desert_photos::{
+use mitten::{
     drag_export,
     storage::{LocalPhotos, PhotosDriver},
 };

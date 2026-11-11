@@ -383,7 +383,7 @@ impl ConnectedPhotos {
             .provider
             .rendition(if preview { sizes.viewer } else { sizes.grid });
         let kind = crate::loading::sized_kind(if preview { "preview" } else { "thumb" }, edge);
-        let directory = self.source.path.join(".desert-photos/cache");
+        let directory = self.source.path.join(".mitten/cache");
         let path = directory.join(format!("{}-{kind}.jpg", digest(&photo.fingerprint)));
         if path.is_file() {
             return Ok(path);
@@ -572,7 +572,7 @@ impl PhotosDriver for ConnectedPhotos {
             return Ok(path);
         }
         ensure!(photo.duration.is_some(), "This is not a video");
-        let directory = self.source.path.join(".desert-photos/cache");
+        let directory = self.source.path.join(".mitten/cache");
         let extension = Path::new(&photo.name)
             .extension()
             .and_then(|e| e.to_str())
@@ -599,7 +599,7 @@ impl PhotosDriver for ConnectedPhotos {
         self.provider.people()
     }
     fn person_thumbnail(&self, id: &str) -> Result<PathBuf> {
-        let directory = self.source.path.join(".desert-photos/cache");
+        let directory = self.source.path.join(".mitten/cache");
         let path = directory.join(format!("{}-person.jpg", digest(id)));
         if path.is_file() {
             return Ok(path);
@@ -629,7 +629,7 @@ impl PhotosDriver for ConnectedPhotos {
         }
         // Fetching the preview probes and caches the motion renditions.
         self.image(photo, true)?;
-        let directory = self.source.path.join(".desert-photos/cache");
+        let directory = self.source.path.join(".mitten/cache");
         let key = digest(&photo.fingerprint);
         let spec = if large {
             crate::storage::MOTION_LARGE

@@ -2,11 +2,11 @@
 //! screen at once, so lookups are one hash probe with no allocation, images
 //! are decoded in parallel batches straight to GPU-ready pixels, and memory is
 //! bounded by bytes with least-recently-drawn eviction.
-use desert_photos::{
+use gpui::*;
+use mitten::{
     loading::Square,
     storage::{Photo, PhotosDriver},
 };
-use gpui::*;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -75,7 +75,7 @@ impl Tiles {
             return None;
         }
         self.placeholder_budget -= 1;
-        let (w, h, pixels) = desert_photos::loading::thumbhash_bgra(hash)?;
+        let (w, h, pixels) = mitten::loading::thumbhash_bgra(hash)?;
         let buffer = image::RgbaImage::from_raw(w, h, pixels)?;
         let image = Arc::new(RenderImage::new([image::Frame::new(buffer)]));
         if self.placeholders.len() >= PLACEHOLDERS {

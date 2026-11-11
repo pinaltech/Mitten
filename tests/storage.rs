@@ -1,4 +1,4 @@
-use desert_photos::storage::{self, LocalPhotos, PhotosDriver, Preferences, Source};
+use mitten::storage::{self, LocalPhotos, PhotosDriver, Preferences, Source};
 use std::{fs, path::Path};
 fn image(path: &Path, color: u8) {
     image::RgbImage::from_pixel(80, 60, image::Rgb([color, 90, 40]))
@@ -147,7 +147,7 @@ fn unsupported_driver_and_damaged_metadata_fail_without_replacing_files() {
         .is_err()
     );
     let _driver = LocalPhotos::open(dir.path()).unwrap();
-    let metadata = dir.path().join(".desert-photos/library.json");
+    let metadata = dir.path().join(".mitten/library.json");
     fs::write(&metadata, "{broken").unwrap();
     assert!(LocalPhotos::open(dir.path()).is_err());
     assert_eq!(fs::read_to_string(metadata).unwrap(), "{broken");
@@ -164,11 +164,7 @@ fn traversal_and_duplicate_album_names_are_rejected() {
             .is_err()
     );
     assert!(driver.trash(&["/tmp/photo.png".into()], true).is_err());
-    assert!(
-        driver
-            .caption(".desert-photos/library.json", "bad")
-            .is_err()
-    );
+    assert!(driver.caption(".mitten/library.json", "bad").is_err());
     assert!(driver.create_album(" ").is_err());
     driver.create_album("Trip").unwrap();
     assert!(driver.create_album("Trip").is_err());
@@ -185,7 +181,7 @@ fn symlinks_are_neither_indexed_nor_used_for_storage() {
     assert!(driver.scan().unwrap().photos.is_empty());
     assert!(driver.caption("linked/outside.png", "bad").is_err());
     let other = tempfile::tempdir().unwrap();
-    std::os::unix::fs::symlink(outside.path(), other.path().join(".desert-photos")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), other.path().join(".mitten")).unwrap();
     assert!(LocalPhotos::open(other.path()).is_err());
 }
 
@@ -318,7 +314,7 @@ fn dense_grid_squares_come_from_originals_once_and_then_from_the_cache() {
         assert!(pixels[centre] > 200 && pixels[centre + 2] < 60);
         assert!(pixels[0] > 150, "left edge is from the blue centre");
         let cache = dir.path().join(format!(
-            ".desert-photos/cache/{}-sq{edge}.jpg",
+            ".mitten/cache/{}-sq{edge}.jpg",
             photos[0].fingerprint
         ));
         assert!(cache.is_file(), "squares are cached for later sessions");

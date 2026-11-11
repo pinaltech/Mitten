@@ -1,12 +1,4 @@
 use chrono::Datelike;
-use desert_photos::gallery::{
-    self, GalleryLayout, GridFrame, Group, Tier, extend_groups, month_key,
-    zoom::{self, Crossfade, Input as ZoomInput, Ladder, Lattice, Layer, Placement, Zoom},
-};
-use desert_photos::loading::{BoundedCache, Square, THUMBNAIL_CACHE, THUMBNAIL_JOBS, VIEWER_CACHE};
-use desert_photos::map;
-use desert_photos::sources::{Connection, PhotoPage, ProviderKind};
-use desert_photos::storage::{self, Library, Photo, PhotosDriver, Preferences, Source};
 use desert_ui::{self as ui, Accent, Colors, library as kit};
 use gpui::{prelude::*, *};
 use gpui_component::{
@@ -15,6 +7,14 @@ use gpui_component::{
     scroll::{Scrollbar, ScrollbarShow},
     switch::Switch,
 };
+use mitten::gallery::{
+    self, GalleryLayout, GridFrame, Group, Tier, extend_groups, month_key,
+    zoom::{self, Crossfade, Input as ZoomInput, Ladder, Lattice, Layer, Placement, Zoom},
+};
+use mitten::loading::{BoundedCache, Square, THUMBNAIL_CACHE, THUMBNAIL_JOBS, VIEWER_CACHE};
+use mitten::map;
+use mitten::sources::{Connection, PhotoPage, ProviderKind};
+use mitten::storage::{self, Library, Photo, PhotosDriver, Preferences, Source};
 use photo_view::PhotoView;
 use std::{
     cell::RefCell,
@@ -129,6 +129,7 @@ mod progress;
 mod settings;
 mod tiles;
 mod video;
+mod window;
 fn provider_logo(provider: ProviderKind, c: Colors) -> AnyElement {
     provider_logo_sized(provider, 30., c)
 }
@@ -412,7 +413,7 @@ struct VisibleCache {
     query: String,
     photos: PhotoView,
 }
-pub struct PhotosApp {
+pub struct MittenApp {
     config_path: PathBuf,
     preferences: Preferences,
     driver: Option<Arc<dyn PhotosDriver>>,
@@ -552,7 +553,7 @@ struct Explore {
     people: Vec<storage::Person>,
     places: Vec<storage::Place>,
 }
-impl PhotosApp {
+impl MittenApp {
     fn new(config_path: PathBuf, w: &mut Window, cx: &mut Context<Self>) -> Self {
         let (preferences, error) = match Preferences::load(&config_path) {
             Ok(p) => (p, None),
@@ -967,9 +968,7 @@ impl PhotosApp {
             let credential_source = source.clone();
             let result = cx
                 .background_executor()
-                .spawn(
-                    async move { desert_photos::sources::forget_credentials(&credential_source) },
-                )
+                .spawn(async move { mitten::sources::forget_credentials(&credential_source) })
                 .await;
             let _ = this.update_in(cx, |this, w, cx| {
                 this.busy = false;
@@ -1073,7 +1072,7 @@ impl PhotosApp {
                     return;
                 }
                 self.preferences = preferences;
-                desert_photos::loading::set_image_sizes(
+                mitten::loading::set_image_sizes(
                     self.preferences.sizes_for(Some(&driver.source().path)),
                 );
                 self.driver = Some(driver);
@@ -1253,13 +1252,12 @@ impl PhotosApp {
                     .background_executor()
                     .offload(move || {
                         let source = config.source(&data)?;
-                        let remote =
-                            desert_photos::sources::remote::Remote::new(config.clone(), &secret)?;
+                        let remote = mitten::sources::remote::Remote::new(config.clone(), &secret)?;
                         let driver: Arc<dyn PhotosDriver> = Arc::new(
-                            desert_photos::sources::ConnectedPhotos::new(source, Box::new(remote))?,
+                            mitten::sources::ConnectedPhotos::new(source, Box::new(remote))?,
                         );
                         let page = driver.page(None)?;
-                        desert_photos::sources::remote::save_connection(&config, &secret, &data)?;
+                        mitten::sources::remote::save_connection(&config, &secret, &data)?;
                         Ok::<_, anyhow::Error>((driver, page))
                     })
                     .await;
@@ -1876,7 +1874,8 @@ impl PhotosApp {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let now = std::time::Instant::now();
+        // GPUI's clock, so tests drive gesture timing with fake time.
+        let now = cx.background_executor().now();
         let idle = self
             .swipe_last
             .is_none_or(|last| now.duration_since(last) > Duration::from_millis(220));
@@ -1933,9 +1932,10 @@ impl PhotosApp {
                                 this.swipe_idle = false;
                                 return true;
                             }
-                            let quiet = this
-                                .swipe_last
-                                .is_none_or(|last| last.elapsed() >= Duration::from_millis(100));
+                            let quiet = this.swipe_last.is_none_or(|last| {
+                                cx.background_executor().now().duration_since(last)
+                                    >= Duration::from_millis(100)
+                            });
                             if quiet {
                                 this.swipe_idle = false;
                                 this.finish_viewer_swipe(w, cx);
@@ -2425,7 +2425,7 @@ impl PhotosApp {
             .map_or(ProviderKind::Local, ProviderKind::of);
         let detail = source
             .as_ref()
-            .map(desert_photos::sources::account_detail)
+            .map(mitten::sources::account_detail)
             .unwrap_or_default();
         let entity = cx.entity();
         div()
@@ -2540,7 +2540,7 @@ impl PhotosApp {
         for (i, source) in self.preferences.sources.iter().enumerate() {
             let current = active.as_ref() == Some(source);
             let count = self.preferences.catalog_counts.get(&source.path).copied();
-            let detail = desert_photos::sources::account_detail(source);
+            let detail = mitten::sources::account_detail(source);
             let detail = match count {
                 Some(n) if detail.is_empty() => format!("{n} items"),
                 Some(n) => format!("{detail} · {n} items"),
@@ -2807,7 +2807,7 @@ impl PhotosApp {
             .filter(|p| !p.path.as_os_str().is_empty())
             .map(|p| p.path.clone())
             .collect();
-        if std::env::var_os("DESERT_PHOTOS_TRACE_DRAGS").is_some() {
+        if std::env::var_os("MITTEN_TRACE_DRAGS").is_some() {
             eprintln!("Photos drag: GPUI prepared {} photos", photos.len());
         }
         *drag.photos.borrow_mut() = photos;
@@ -5267,7 +5267,7 @@ impl PhotosApp {
             Modal::Browse => "Library & albums",
             Modal::Album => "New album",
             Modal::AddToAlbum => "Add to album",
-            Modal::Help => "Tonto Help",
+            Modal::Help => "Mitten Help",
             Modal::DeleteConfirm => "Delete photos",
         };
         let mut content = div()
@@ -5635,7 +5635,7 @@ fn lerp_bounds(a: Bounds<Pixels>, b: Bounds<Pixels>, t: f32) -> Bounds<Pixels> {
         ),
     )
 }
-impl Render for PhotosApp {
+impl Render for MittenApp {
     fn render(&mut self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(not(test))]
         ui::native_titlebar::sync_layout(w);
@@ -5648,8 +5648,8 @@ impl Render for PhotosApp {
         }
         let guard_entity = cx.weak_entity();
         let mut root = div()
-            .id("photos-app")
-            .debug_selector(|| "photos-app".into())
+            .id("mitten-app")
+            .debug_selector(|| "mitten-app".into())
             .key_context("Photos")
             .track_focus(&self.focus)
             .relative()
@@ -5660,7 +5660,7 @@ impl Render for PhotosApp {
             .bg(rgb(c.raised))
             .text_color(rgb(c.text))
             .text_size(px(13.))
-            .map(|d| ui::window_frame(d, c, w))
+            .map(|d| window::window_frame(d, c, w))
             .child(
                 canvas(
                     |_, _, _| (),
@@ -5802,7 +5802,7 @@ impl Render for PhotosApp {
                     }),
                 ),
             )
-            .child(ui::app_brand("brand/tonto.svg", "Tonto", width >= 480.))
+            .child(ui::app_brand("brand/mitten.svg", "Mitten", width >= 480.))
             .child(div().flex_1());
         if let Some((label, progress)) = self.loading_status() {
             bar = bar.child(progress::indicator(label, progress, width >= 700., c));
@@ -5837,7 +5837,7 @@ impl Render for PhotosApp {
         bar =
             bar.child(ui::toolbar_separator(c))
                 .when(width >= 520., |d| {
-                    d.child(kit::tool("help", "info", "Tonto Help", c).on_click(
+                    d.child(kit::tool("help", "info", "Mitten Help", c).on_click(
                         cx.listener(|this, _, w, cx| this.open_modal(Modal::Help, w, cx)),
                     ))
                 })
@@ -5851,7 +5851,7 @@ impl Render for PhotosApp {
                 w.remove_window();
             }
         });
-        root = root.child(ui::client_titlebar(bar, c, close, w, cx));
+        root = root.child(window::client_titlebar(bar, c, close, w, cx));
         if let Some(error) = &self.error {
             root = root.child(
                 div()
@@ -5894,8 +5894,8 @@ impl Render for PhotosApp {
                             .into_any_element()
                     } else {
                         kit::welcome_brand(
-                            "brand/tonto.svg",
-                            "Welcome to Tonto",
+                            "brand/mitten.svg",
+                            "Welcome to Mitten",
                             "Choose a library to get started.",
                             c,
                         )
@@ -6110,7 +6110,7 @@ impl Render for PhotosApp {
                     .min_w_0()
                     .flex()
                     .when(show_sidebar, |d| {
-                        d.child(self.sidebar_view(c, ui::window_corners(w).bottom_left, cx))
+                        d.child(self.sidebar_view(c, window::window_corners(w).bottom_left, cx))
                     })
                     .child(main)
                     .children(inspector),
@@ -6249,9 +6249,9 @@ pub(crate) fn field(input: Input, c: Colors) -> Input {
     input.bg(rgb(c.bg))
 }
 pub fn run() -> anyhow::Result<()> {
-    let project = directories::ProjectDirs::from("com", "pinal", "DesertPhotos")
+    let project = directories::ProjectDirs::from("tech", "pinal", "mitten")
         .ok_or_else(|| anyhow::anyhow!("Cannot locate application data"))?;
-    let data = std::env::var_os("DESERT_PHOTOS_DATA_DIR")
+    let data = std::env::var_os("MITTEN_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| project.data_dir().into());
     std::fs::create_dir_all(&data)?;
@@ -6264,14 +6264,14 @@ pub fn run() -> anyhow::Result<()> {
             register_shortcuts(cx);
             cx.set_menus(vec![
                 Menu {
-                    name: "Tonto".into(),
+                    name: "Mitten".into(),
                     items: vec![
                         MenuItem::action("Settings…", Settings),
                         MenuItem::separator(),
-                        MenuItem::action("Hide Tonto", Hide),
+                        MenuItem::action("Hide Mitten", Hide),
                         MenuItem::action("Hide Others", HideOthers),
                         MenuItem::separator(),
-                        MenuItem::action("Quit Tonto", Quit),
+                        MenuItem::action("Quit Mitten", Quit),
                     ],
                 },
                 Menu {
@@ -6304,7 +6304,7 @@ pub fn run() -> anyhow::Result<()> {
                     ))),
                     window_min_size: Some(size(px(360.), px(360.))),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("Tonto".into()),
+                        title: Some("Mitten".into()),
                         appears_transparent: cfg!(target_os = "macos"),
                         ..Default::default()
                     }),
@@ -6317,11 +6317,11 @@ pub fn run() -> anyhow::Result<()> {
                 |w, cx| {
                     ui::native_titlebar::install(w);
                     ui::native_transfer::install_magnify(w);
-                    let view = cx.new(|cx| PhotosApp::new(data.join("settings.json"), w, cx));
+                    let view = cx.new(|cx| MittenApp::new(data.join("settings.json"), w, cx));
                     cx.new(|cx| Root::new(view, w, cx))
                 },
             )
-            .expect("Cannot open the Tonto window");
+            .expect("Cannot open the Mitten window");
             cx.on_window_closed(|cx| {
                 if cx.windows().is_empty() {
                     cx.quit();

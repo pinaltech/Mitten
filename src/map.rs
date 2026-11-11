@@ -134,7 +134,7 @@ mod fetch {
             .connect_timeout(Duration::from_secs(8))
             .timeout(Duration::from_secs(20))
             // Tile servers' usage policies ask clients to identify themselves.
-            .user_agent(concat!("Tonto-Photos/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("Mitten/", env!("CARGO_PKG_VERSION")))
             .build()?;
         let center = world_pixel(lat, lon, zoom);
         let left = center.0 - f64::from(width) / 2.;

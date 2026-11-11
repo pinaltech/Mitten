@@ -631,7 +631,7 @@ impl LocalPhotos {
         let this = Self {
             root: path.canonicalize()?,
         };
-        let cache = this.safe(".desert-photos/cache")?;
+        let cache = this.safe(".mitten/cache")?;
         fs::create_dir_all(cache)?;
         this.metadata()?;
         Ok(this)
@@ -661,7 +661,7 @@ impl LocalPhotos {
         self.safe(id)
     }
     pub(crate) fn metadata(&self) -> Result<Metadata> {
-        let path = self.safe(".desert-photos/library.json")?;
+        let path = self.safe(".mitten/library.json")?;
         if !path.exists() {
             return Ok(Metadata::default());
         }
@@ -673,7 +673,7 @@ impl LocalPhotos {
             .truncate(false)
             .read(true)
             .write(true)
-            .open(self.safe(".desert-photos/write.lock")?)?;
+            .open(self.safe(".mitten/write.lock")?)?;
         file.lock()?;
         Ok(file)
     }
@@ -681,7 +681,7 @@ impl LocalPhotos {
         let _lock = self.write_lock()?;
         let mut meta = self.metadata()?;
         f(&mut meta)?;
-        atomic_json(&self.safe(".desert-photos/library.json")?, &meta)
+        atomic_json(&self.safe(".mitten/library.json")?, &meta)
     }
     fn walk(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         for entry in fs::read_dir(path)? {
@@ -699,10 +699,7 @@ impl LocalPhotos {
         Ok(())
     }
     fn decode(&self, photo: &Photo, edge: u32, kind: &str) -> Result<PathBuf> {
-        let target = self.safe(&format!(
-            ".desert-photos/cache/{}-{kind}.jpg",
-            photo.fingerprint
-        ))?;
+        let target = self.safe(&format!(".mitten/cache/{}-{kind}.jpg", photo.fingerprint))?;
         if target.is_file() {
             return Ok(target);
         }
@@ -852,7 +849,7 @@ impl PhotosDriver for LocalPhotos {
             .iter()
             .map(|photo| {
                 let cache = self.safe(&format!(
-                    ".desert-photos/cache/{}",
+                    ".mitten/cache/{}",
                     crate::loading::Square::file_name_for(&photo.fingerprint, edge)
                 ))?;
                 crate::loading::cached_square(&cache, edge, || {
@@ -871,7 +868,7 @@ impl PhotosDriver for LocalPhotos {
         if !may_move(&photo.name) {
             return Ok(None);
         }
-        let cache = self.safe(".desert-photos/cache/probe")?;
+        let cache = self.safe(".mitten/cache/probe")?;
         cached_motion(
             cache.parent().unwrap(),
             &photo.fingerprint,

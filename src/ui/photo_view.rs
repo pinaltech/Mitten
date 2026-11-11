@@ -1,4 +1,4 @@
-use desert_photos::storage::{Library, Photo};
+use mitten::storage::{Library, Photo};
 use std::sync::Arc;
 
 /// Unfiltered libraries need only a length; filtered views share indices, never

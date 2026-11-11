@@ -16,7 +16,7 @@ fn main() {
         let plist =
             PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("native/Info.plist");
         println!(
-            "cargo:rustc-link-arg-bin=desert-photos=-Wl,-sectcreate,__TEXT,__info_plist,{}",
+            "cargo:rustc-link-arg-bin=mitten=-Wl,-sectcreate,__TEXT,__info_plist,{}",
             plist.display()
         );
     }

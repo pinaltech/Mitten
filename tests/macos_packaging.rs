@@ -1,7 +1,7 @@
 #![cfg(all(target_os = "macos", feature = "apple-photos"))]
 
-use desert_photos::sources::{open, verify_photokit_configuration};
-use desert_photos::storage::{Photo, Source};
+use mitten::sources::{open, verify_photokit_configuration};
+use mitten::storage::{Photo, Source};
 
 #[test]
 fn missing_usage_description_is_reported_before_requesting_photos_access() {

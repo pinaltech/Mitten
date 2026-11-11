@@ -18,4 +18,4 @@
 .env.*
 
 # Local app profiles / test data
-.desert-photos/
+.mitten/

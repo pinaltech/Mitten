@@ -16,7 +16,7 @@ const IMAGE_LIMIT: u64 = 32 * 1024 * 1024;
 
 pub fn credential(source: &Source) -> Result<keyring::Entry> {
     Ok(keyring::Entry::new(
-        "com.pinal.DesertPhotos",
+        "tech.pinal.mitten",
         &digest(&source.path.to_string_lossy()),
     )?)
 }

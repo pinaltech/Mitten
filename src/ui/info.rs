@@ -75,7 +75,7 @@ pub(super) fn face(path: Option<PathBuf>, edge: f32, c: Colors) -> Div {
             None => kit::glyph("person", edge * 0.5, c.muted).into_any_element(),
         })
 }
-impl PhotosApp {
+impl MittenApp {
     /// Keeps the description field on the shown photo and fetches its
     /// details (and then its map) when they are not loaded yet.
     pub(super) fn prepare_info(&mut self, w: &mut Window, cx: &mut Context<Self>) {

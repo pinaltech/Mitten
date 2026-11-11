@@ -6,7 +6,7 @@ use std::collections::HashSet;
 const PEOPLE_PREVIEW: usize = 24;
 const SEARCH_DELAY: Duration = Duration::from_millis(350);
 
-impl PhotosApp {
+impl MittenApp {
     pub(super) fn explore_supported(&self) -> bool {
         self.driver.as_ref().is_some_and(|d| d.explore())
     }
