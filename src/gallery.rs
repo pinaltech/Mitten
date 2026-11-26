@@ -511,11 +511,9 @@ impl GridFrame {
 /// through [`Zoom::tick`] and [`Crossfade::aim`], and drawing reads [`Layer`].
 pub mod zoom {
     use super::{GalleryLayout, GridFrame, Rect, Tier};
-    use std::{
-        collections::VecDeque,
-        ops::Range,
-        time::{Duration, Instant},
-    };
+    use std::{collections::VecDeque, ops::Range, time::Duration};
+    // std's clock does not exist in the browser; web_time is std's elsewhere.
+    use web_time::Instant;
 
     /// Spring stiffness (rad/s) of the snap: critically damped, settling in
     /// roughly a third of a second while carrying the release velocity.
@@ -1524,7 +1522,8 @@ mod tests {
     }
     #[test]
     fn photos_crossfade_level_by_level_on_a_fixed_clock() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
+        use web_time::Instant;
         use zoom::*;
         let t0 = Instant::now();
         let ms = |n: u64| t0 + Duration::from_millis(n);
@@ -1555,7 +1554,8 @@ mod tests {
     }
     #[test]
     fn gestures_head_to_the_next_level_at_once_and_release_commits_past_a_little() {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
+        use web_time::Instant;
         use zoom::*;
         let ladder = Ladder::for_width(1000., 8);
         let t0 = Instant::now();

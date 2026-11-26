@@ -193,6 +193,7 @@ fn onboarding_exposes_service_logos_and_connection_forms(cx: &mut TestAppContext
     assert!(brand.size.width >= px(20.) && brand.left() < bounds(cx, "topbar").center().x);
     assert!(cx.debug_bounds("welcome").is_some());
     for name in [
+        "connect-pinal-photos",
         "connect-local-folder",
         "connect-apple-photos",
         "connect-immich",
@@ -200,10 +201,16 @@ fn onboarding_exposes_service_logos_and_connection_forms(cx: &mut TestAppContext
     ] {
         assert!(cx.debug_bounds(name).is_some(), "missing {name}");
     }
-    for (width, height) in [(360., 720.), (820., 740.), (1440., 900.)] {
+    // A phone-width window tall enough to show every service without scrolling.
+    for (width, height) in [(360., 880.), (820., 740.), (1440., 900.)] {
         cx.simulate_resize(size(px(width), px(height)));
         frame(cx);
+        // Pinal Photos leads, as a banner above the other services.
         inside(cx, "provider-grid", width, height);
+        inside(cx, "connect-pinal-photos", width, height);
+        let banner = bounds(cx, "connect-pinal-photos");
+        let grid = bounds(cx, "provider-grid");
+        assert!(banner.bottom() <= grid.top() && banner.size.width >= grid.size.width - px(1.));
         #[cfg(feature = "remote")]
         {
             for (id, provider) in [
@@ -300,7 +307,7 @@ fn blank_click_marquee_viewer_zoom_delete_confirmation_and_album_spaces(cx: &mut
     });
     app.update_in(cx, |app, w, cx| {
         app.modal = None;
-        app.focus.focus(w);
+        app.focus.focus(w, cx);
         cx.notify();
     });
     frame(cx);
@@ -338,7 +345,8 @@ fn blank_click_marquee_viewer_zoom_delete_confirmation_and_album_spaces(cx: &mut
     app.read_with(cx, |app, _| assert_eq!(app.selected.len(), 1));
     app.read_with(cx, |app, _| assert!(app.viewer.is_some()));
     let canvas = bounds(cx, "viewer-canvas");
-    cx.simulate_event(ScrollWheelEvent {
+    cx.simulate_event(ScrollEvent {
+        source: ScrollSource::Pointer,
         position: canvas.center(),
         delta: ScrollDelta::Lines(point(0., 3.)),
         ..Default::default()
@@ -348,7 +356,8 @@ fn blank_click_marquee_viewer_zoom_delete_confirmation_and_album_spaces(cx: &mut
         assert_eq!(app.viewport.pan, (0., 0.));
         assert_eq!(app.viewport.zoom, 1.);
     });
-    cx.simulate_event(ScrollWheelEvent {
+    cx.simulate_event(ScrollEvent {
+        source: ScrollSource::Pointer,
         position: canvas.center(),
         delta: ScrollDelta::Pixels(point(px(0.), px(100.))),
         modifiers: Modifiers {
@@ -549,7 +558,9 @@ fn scrolling_a_million_photo_grid_only_loads_visible_thumbnails(cx: &mut TestApp
         app.select(0, true, Modifiers::none(), w, cx)
     });
     frame(cx);
-    assert_eq!(counters.previews.load(SeqCst), 1);
+    // The opened photo's preview, plus its one neighbour's once it is sharp
+    // (the first photo has no previous one).
+    assert!((1..=2).contains(&counters.previews.load(SeqCst)));
     assert_eq!(counters.originals.load(SeqCst), 0);
 }
 
@@ -670,7 +681,7 @@ fn accent_settings_removal_gapless_gallery_and_side_navigation(cx: &mut TestAppC
     );
     app.update_in(cx, |app, w, cx| {
         app.modal = None;
-        app.focus.focus(w);
+        app.focus.focus(w, cx);
         cx.notify();
     });
     frame(cx);
@@ -1070,7 +1081,8 @@ fn viewer_swipes_settle_once_pan_only_when_zoomed_and_toolbars_frame_image(
         (-100., TouchPhase::Moved),
         (0., TouchPhase::Ended),
     ] {
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
+            source: ScrollSource::Pointer,
             position: canvas.center(),
             delta: ScrollDelta::Pixels(point(px(dx), px(0.))),
             touch_phase: phase,
@@ -1194,7 +1206,8 @@ fn dense_gallery_keeps_every_visible_thumbnail_decoded_after_zoom_and_scroll(
     paint_frames(cx, 2);
     assert!(cx.debug_bounds("gallery-motion").is_some());
     // Scroll interrupts an active pinch; the real virtual grid must remain live.
-    cx.simulate_event(ScrollWheelEvent {
+    cx.simulate_event(ScrollEvent {
+        source: ScrollSource::Pointer,
         position: pointer,
         delta: ScrollDelta::Pixels(point(px(0.), px(-80.))),
         touch_phase: TouchPhase::Started,
@@ -1286,7 +1299,8 @@ fn command_scroll_zooms_without_scrolling_and_chains_wheel_notches(cx: &mut Test
     frame(cx);
     let pointer = bounds(cx, "photo-grid").center();
     let wheel = |cx: &mut VisualTestContext, y: f32| {
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
+            source: ScrollSource::Pointer,
             position: pointer,
             delta: ScrollDelta::Lines(point(0., y)),
             modifiers: Modifiers {
@@ -1343,7 +1357,8 @@ fn command_scroll_zooms_without_scrolling_and_chains_wheel_notches(cx: &mut Test
     let settled = app.read_with(cx, |app, _| app.scroll.0.borrow().base_handle.offset());
     assert_ne!(settled, offset, "zoom re-anchors the grid");
     wheel(cx, 0.);
-    cx.simulate_event(ScrollWheelEvent {
+    cx.simulate_event(ScrollEvent {
+        source: ScrollSource::Pointer,
         position: pointer,
         delta: ScrollDelta::Pixels(point(px(0.), px(30.))),
         modifiers: Modifiers {
@@ -1360,7 +1375,8 @@ fn command_scroll_zooms_without_scrolling_and_chains_wheel_notches(cx: &mut Test
         assert_eq!(zoom_state(app).phase, Phase::Settling { target });
     });
     let trackpad = |cx: &mut VisualTestContext, y: f32, touch_phase: TouchPhase| {
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
+            source: ScrollSource::Pointer,
             position: pointer,
             delta: ScrollDelta::Pixels(point(px(0.), px(y))),
             modifiers: Modifiers {
@@ -1762,7 +1778,8 @@ fn viewer_stops_at_fit_and_zoom_out_returns_to_library(cx: &mut TestAppContext) 
     assert!(cx.debug_bounds("photo-tile-3").is_some());
     let grid = bounds(cx, "photo-grid");
     let before = app.read_with(cx, |app, _| app.gallery_level);
-    cx.simulate_event(ScrollWheelEvent {
+    cx.simulate_event(ScrollEvent {
+        source: ScrollSource::Pointer,
         position: grid.center(),
         delta: ScrollDelta::Pixels(point(px(0.), px(-100.))),
         modifiers: Modifiers {
@@ -1784,7 +1801,8 @@ fn viewer_stops_at_fit_and_zoom_out_returns_to_library(cx: &mut TestAppContext) 
     });
     frame(cx);
     let canvas = bounds(cx, "viewer-canvas");
-    cx.simulate_event(ScrollWheelEvent {
+    cx.simulate_event(ScrollEvent {
+        source: ScrollSource::Pointer,
         position: canvas.center(),
         delta: ScrollDelta::Pixels(point(px(0.), px(-30.))),
         touch_phase: TouchPhase::Started,
@@ -2435,4 +2453,160 @@ fn placeholders_stand_in_until_images_arrive(cx: &mut TestAppContext) {
     });
     frame(cx);
     assert!(cx.debug_bounds("viewer-image-layers").is_some());
+}
+
+/// Browsers send wheels without gesture phases: a pinch is a Ctrl-wheel run
+/// and a trackpad swipe's momentum looks like more swiping.
+#[gpui::test]
+fn phaseless_wheels_pinch_out_closes_and_swipes_move_one_photo(cx: &mut TestAppContext) {
+    cx.update(ui::init);
+    let data = tempfile::tempdir().unwrap();
+    for i in 0..8 {
+        image::RgbImage::from_pixel(160, 100, image::Rgb([i * 20, 90, 110]))
+            .save(data.path().join(format!("Photo {i}.png")))
+            .unwrap();
+    }
+    let driver: Arc<dyn PhotosDriver> = Arc::new(storage::LocalPhotos::open(data.path()).unwrap());
+    let mut entity = None;
+    let window = cx.add_window(|w, cx| {
+        let app = cx.new(|cx| {
+            let mut app = MittenApp::new(data.path().join("profile/settings.json"), w, cx);
+            app.phaseless_wheels = true;
+            app.finish_connection(Ok((driver.clone(), driver.page(None).unwrap())), w, cx);
+            app
+        });
+        entity = Some(app.clone());
+        Root::new(app, w, cx)
+    });
+    let app = entity.unwrap();
+    let cx = VisualTestContext::from_window(window.into(), cx).into_mut();
+    cx.simulate_resize(size(px(1060.), px(760.)));
+    frame(cx);
+    app.update_in(cx, |app, w, cx| app.select(3, true, Modifiers::none(), w, cx));
+    frame(cx);
+    let canvas = bounds(cx, "viewer-canvas");
+    let wheel = |cx: &mut VisualTestContext, dx: f32, dy: f32, control: bool| {
+        cx.simulate_event(ScrollEvent {
+            source: ScrollSource::Pointer,
+            position: canvas.center(),
+            delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
+            modifiers: Modifiers { control, ..Default::default() },
+            touch_phase: TouchPhase::Moved,
+        });
+    };
+
+    // A swipe and its momentum, one event a frame with no pause: one photo.
+    for dx in [-30., -60., -90., -90., -70., -50., -40., -30., -20., -14., -10., -6., -4., -2.] {
+        cx.executor().advance_clock(Duration::from_millis(16));
+        wheel(cx, dx, 0., false);
+        cx.run_until_parked();
+    }
+    for _ in 0..30 {
+        cx.executor().advance_clock(Duration::from_millis(16));
+        cx.run_until_parked();
+    }
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.anchor, Some(4), "one swipe moves one photo");
+        assert_eq!(app.swipe_offset, 0.);
+        assert!(!app.swipe_settling);
+    });
+    // After a pause, the next swipe moves on again.
+    cx.executor().advance_clock(Duration::from_millis(400));
+    for dx in [-60., -120., -120., -40.] {
+        cx.executor().advance_clock(Duration::from_millis(16));
+        wheel(cx, dx, 0., false);
+        cx.run_until_parked();
+    }
+    for _ in 0..30 {
+        cx.executor().advance_clock(Duration::from_millis(16));
+        cx.run_until_parked();
+    }
+    app.read_with(cx, |app, _| assert_eq!(app.anchor, Some(5)));
+    // A short swipe that stops settles back where it was.
+    cx.executor().advance_clock(Duration::from_millis(400));
+    wheel(cx, -30., 0., false);
+    for _ in 0..30 {
+        cx.executor().advance_clock(Duration::from_millis(16));
+        cx.run_until_parked();
+    }
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.anchor, Some(5));
+        assert_eq!(app.swipe_offset, 0.);
+    });
+    // A new swipe while the last one's momentum is still fading, with no
+    // pause between them: it is the fingers again, and moves on once more.
+    cx.executor().advance_clock(Duration::from_millis(400));
+    for dx in [-40., -90., -120., -110., -80., -50., -30., -18., -10., -6., -4., -3., -6., -20., -60., -120., -120., -60.] {
+        cx.executor().advance_clock(Duration::from_millis(16));
+        wheel(cx, dx, 0., false);
+        cx.run_until_parked();
+    }
+    for _ in 0..30 {
+        cx.executor().advance_clock(Duration::from_millis(16));
+        cx.run_until_parked();
+    }
+    app.read_with(cx, |app, _| assert_eq!(app.anchor, Some(7), "two swipes, two photos"));
+    app.update_in(cx, |app, w, cx| app.select(5, true, Modifiers::none(), w, cx));
+
+    // Pinching in (Ctrl-wheel up) zooms; pinching out at fit closes.
+    cx.executor().advance_clock(Duration::from_millis(400));
+    wheel(cx, 0., 40., true);
+    app.read_with(cx, |app, _| assert!(app.viewport.zoom > 1.));
+    cx.executor().advance_clock(Duration::from_millis(400));
+    for _ in 0..20 {
+        cx.executor().advance_clock(Duration::from_millis(16));
+        wheel(cx, 0., -20., true);
+        if app.read_with(cx, |app, _| app.viewer.is_none()) {
+            break;
+        }
+    }
+    app.read_with(cx, |app, _| assert_eq!(app.viewport.zoom, 1., "zooming out stops at fit"));
+    // Lift, then pinch out again from fit: the viewer closes.
+    cx.executor().advance_clock(Duration::from_millis(400));
+    for _ in 0..4 {
+        cx.executor().advance_clock(Duration::from_millis(16));
+        wheel(cx, 0., -6., true);
+    }
+    app.read_with(cx, |app, _| assert!(app.viewer.is_none(), "pinching out at fit closes the viewer"));
+}
+
+/// Reopening the library used last time shows "Loading libraries", not the
+/// onboarding, until it has connected.
+#[gpui::test]
+fn reconnecting_at_start_shows_loading_not_onboarding(cx: &mut TestAppContext) {
+    cx.update(ui::init);
+    let data = tempfile::tempdir().unwrap();
+    image::RgbImage::from_pixel(64, 48, image::Rgb([120, 90, 60]))
+        .save(data.path().join("Photo.png"))
+        .unwrap();
+    let settings = data.path().join("profile/settings.json");
+    let mut preferences = Preferences::default();
+    preferences.connect(Source {
+        driver: "local-folder".into(),
+        path: data.path().to_path_buf(),
+    });
+    preferences.save(&settings).unwrap();
+    let mut entity = None;
+    let window = cx.add_window(|w, cx| {
+        let app = cx.new(|cx| MittenApp::new(settings.clone(), w, cx));
+        entity = Some(app.clone());
+        Root::new(app, w, cx)
+    });
+    let app = entity.unwrap();
+    let cx = VisualTestContext::from_window(window.into(), cx).into_mut();
+    app.read_with(cx, |app, _| {
+        assert!(app.restoring);
+        assert!(app.driver.is_none());
+    });
+    cx.update(|w, cx| {
+        w.draw(cx).clear(cx);
+    });
+    assert!(cx.debug_bounds("restoring-library").is_some());
+    assert!(cx.debug_bounds("welcome").is_none(), "no onboarding while reconnecting");
+    frame(cx);
+    app.read_with(cx, |app, _| {
+        assert!(!app.restoring);
+        assert!(app.driver.is_some());
+    });
+    assert!(cx.debug_bounds("restoring-library").is_none());
 }

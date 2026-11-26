@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Mitten</title>
+<link rel="icon" href="mitten/icon.png">
+<link rel="stylesheet" href="mitten/shell.css">
+<!-- host.js describes the site Mitten runs in (name, branding, help, sign-in);
+     glue.js is what Mitten does in the page outside its canvas. -->
+<script src="host.js"></script>
+<script src="mitten/glue.js"></script>
+<script type="module" src="mitten/boot.js"></script>
+</head>
+<body>
+<main id="mitten-loading" aria-live="polite">
+	<div class="mitten-loading-card">
+		<img class="mitten-loading-icon" src="mitten/icon.png" alt="" width="96" height="96">
+		<h1 id="mitten-loading-title">Starting Mitten</h1>
+		<div class="mitten-progress" role="progressbar" aria-label="Starting Mitten" aria-valuemin="0" aria-valuemax="100"><span></span></div>
+		<p id="mitten-loading-detail">&nbsp;</p>
+	</div>
+</main>
+</body>
+</html>

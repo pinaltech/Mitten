@@ -302,7 +302,7 @@ impl MittenApp {
                         .cursor_pointer()
                         .when_some(thumbnail, |d, path| {
                             d.child(
-                                img(Arc::<std::path::Path>::from(path))
+                                img(crate::ui::image_source(&path))
                                     .size_full()
                                     .object_fit(ObjectFit::Cover),
                             )

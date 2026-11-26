@@ -8,7 +8,7 @@ autobenches = false
 
 [features]
 default = ["native-ui", "remote", "apple-photos"]
-native-ui = ["dep:desert-ui", "dep:gpui", "dep:gpui-component", "dep:raw-window-handle"]
+native-ui = ["dep:desert-ui", "dep:gpui", "dep:gpui-component", "dep:gpui-platform", "dep:gpui-web", "dep:raw-window-handle"]
 remote = ["dep:reqwest", "dep:reqwest_dav", "dep:tokio", "dep:roxmltree", "dep:keyring"]
 apple-photos = []
 
@@ -20,11 +20,16 @@ required-features = ["native-ui"]
 [dependencies]
 anyhow = "1"
 blocking = "1.7"
-chrono = { version = "0.4", features = ["serde"] }
-desert-ui = { git = "https://github.com/pinaltech/DesertUI", branch = "main", version = "0.1.0", optional = true }
+# `wasmbind`: the browser's clock (std's panics there).
+chrono = { version = "0.4", features = ["serde", "wasmbind"] }
+web-time = "1"
+# DesertUI's gpui-pre version, on its `gpui-pre` branch until that is merged.
+desert-ui = { git = "https://github.com/pinaltech/DesertUI", branch = "gpui-pre", version = "0.2.0", optional = true }
 directories = "6"
-gpui = { version = "=0.2.2", optional = true }
-gpui-component = { version = "=0.5.1", optional = true }
+# GPUI from the gpui-pre snapshots of Zed, as Picacho uses; unlike gpui 0.2 it
+# also runs in the browser (WebGPU). gpui-component 0.9.1 pins gpui-pre =0.3.12.
+gpui = { package = "gpui-pre", version = "=0.3.12", default-features = false, optional = true }
+gpui-component = { version = "=0.9.1", optional = true }
 kamadak-exif = "0.6"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "tiff", "bmp"] }
 serde = { version = "1", features = ["derive"] }
@@ -49,12 +54,47 @@ keyring = { version = "3.6", features = ["windows-native"], optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6", features = ["linux-native"], optional = true }
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# The desktop platforms. Without `font-kit` macOS draws no text, and without
+# `wayland` or `x11` Linux opens no window. Metal shaders compile at runtime.
+gpui-platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit", "wayland", "x11", "runtime_shaders"], optional = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+# The browser: GPUI's web platform (WebGPU, else WebGL2) with its worker
+# threads, which need the page cross-origin isolated (see web/README.md).
+gpui-platform = { package = "gpui-pre-platform", version = "=0.3.12", optional = true }
+gpui-web = { package = "gpui-pre-web", version = "=0.3.12", optional = true }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["Window", "Location", "Storage", "XmlHttpRequest", "XmlHttpRequestResponseType"] }
+uuid = { version = "1", features = ["v4", "js"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
 [dev-dependencies]
-gpui = { version = "=0.2.2", features = ["test-support"] }
+gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }
 
 [profile.dev]
 debug = 0
 
+# The UI framework lays out and paints the whole window each frame; optimize
+# it in development builds so debug runs show real frame cost (as Picacho).
+[profile.dev.package.gpui-pre]
+opt-level = 2
+
+[patch.crates-io]
+# GPUI's web worker threads without `eval` (see the folder's README).
+wasm_thread = { path = "patches/wasm_thread" }
+
 [profile.release]
 lto = "thin"
 strip = true
+
+# The browser build (web/build.sh): small, since the page downloads it.
+# Not stripped here: wasm-bindgen reads its feature section, then drops names.
+[profile.web]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = false
+panic = "abort"

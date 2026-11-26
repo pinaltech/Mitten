@@ -4,7 +4,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     Root, Theme, ThemeMode,
     input::{Input, InputEvent, InputState},
-    scroll::{Scrollbar, ScrollbarShow},
+    scroll::{Scrollbar, ScrollbarMode},
     switch::Switch,
 };
 use mitten::gallery::{
@@ -97,7 +97,7 @@ impl Render for DragPhotos {
                 .bg(rgb(c.soft))
                 .when_some(self.preview.clone(), |d, path| {
                     d.child(
-                        img(Arc::<std::path::Path>::from(path))
+                        img(crate::ui::image_source(&path))
                             .w_full()
                             .h(px(55.))
                             .object_fit(ObjectFit::Cover),
@@ -120,7 +120,10 @@ struct Marquee {
     baseline: BTreeSet<String>,
 }
 mod assets;
+#[cfg(target_family = "wasm")]
+mod browser;
 mod explore;
+mod host;
 mod image_cache;
 mod info;
 mod native_drag;
@@ -134,6 +137,9 @@ fn provider_logo(provider: ProviderKind, c: Colors) -> AnyElement {
     provider_logo_sized(provider, 30., c)
 }
 fn provider_logo_sized(provider: ProviderKind, edge: f32, c: Colors) -> AnyElement {
+    if provider == ProviderKind::Pinal {
+        return pinal_tile(edge, c).into_any_element();
+    }
     if provider == ProviderKind::Local {
         return div()
             .size(px(edge))
@@ -151,6 +157,38 @@ fn provider_logo_sized(provider: ProviderKind, edge: f32, c: Colors) -> AnyEleme
     .size(px(edge))
     .flex_shrink_0()
     .into_any_element()
+}
+/// Where an image a source handed over lives: a file on this device or, in
+/// the browser, a URL that GPUI fetches (with the page's sign-in).
+pub(crate) fn image_resource(path: &std::path::Path) -> Resource {
+    let text = path.to_string_lossy();
+    if text.starts_with("https://") || text.starts_with("http://") {
+        Resource::Uri(SharedUri::from(text.into_owned()))
+    } else {
+        Resource::Path(Arc::from(path))
+    }
+}
+pub(crate) fn image_source(path: &std::path::Path) -> ImageSource {
+    ImageSource::Resource(image_resource(path))
+}
+/// Pinal's mark on a light tile, as Picacho draws it for Pinal Mail.
+fn pinal_tile(edge: f32, c: Colors) -> Div {
+    let dark = c.bg == Colors::new(true, Accent::Orange).bg;
+    div()
+        .size(px(edge))
+        .flex_shrink_0()
+        .rounded(px(edge * 0.25))
+        .bg(rgb(if dark { 0xf4f5f7 } else { 0xffffff }))
+        .border_1()
+        .border_color(rgb(c.border))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            img("brand/pinal.svg")
+                .w(px(edge * 0.7))
+                .h(px(edge * 0.7 * 468. / 568.)),
+        )
 }
 /// A library's name in the switcher: the service, or a local folder's name.
 fn library_name(source: &Source) -> String {
@@ -259,7 +297,7 @@ fn paint_cover(
         f32::from(rect.size.height).max(0.01),
     );
     if ((iw / ih) / (rw / rh) - 1.).abs() < 0.02 {
-        let _ = w.paint_image(rect, corners, image, 0, false);
+        let _ = w.paint_image(rect, rect, corners, image, 0, false);
         return;
     }
     let scale = (rw / iw).max(rh / ih);
@@ -268,7 +306,7 @@ fn paint_cover(
         size(px(iw * scale), px(ih * scale)),
     );
     w.with_content_mask(Some(ContentMask { bounds: rect }), |w| {
-        let _ = w.paint_image(cover, Corners::default(), image, 0, false);
+        let _ = w.paint_image(cover, cover, Corners::default(), image, 0, false);
     });
 }
 /// A month ("October 2026") or year ("2026") section header, scaled by `k`.
@@ -443,6 +481,9 @@ pub struct MittenApp {
     source_label: String,
     album_counts: std::collections::BTreeMap<String, usize>,
     provider_step: Option<ProviderKind>,
+    /// Stops a Pinal sign-in waiting on the browser.
+    #[cfg(feature = "remote")]
+    pinal_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     server: Entity<InputState>,
     username: Entity<InputState>,
     secret: Entity<InputState>,
@@ -466,19 +507,31 @@ pub struct MittenApp {
     gallery_zoom: Option<GalleryZoom>,
     gallery_ticking: bool,
     // Trackpad momentum after a ⌘-scroll ends must not restart the zoom.
-    gallery_momentum: Option<std::time::Instant>,
+    gallery_momentum: Option<web_time::Instant>,
     // The ⌘-scroll in progress: travel toward its next step, the direction
     // of its last step (0 before the first), and when it last moved.
-    zoom_scroll: Option<(f32, f32, std::time::Instant)>,
+    zoom_scroll: Option<(f32, f32, web_time::Instant)>,
     swipe_offset: f32,
     swipe_active: bool,
     swipe_epoch: u64,
     swipe_settling: bool,
     swipe_blocked: bool,
-    swipe_last: Option<std::time::Instant>,
+    swipe_last: Option<web_time::Instant>,
     swipe_idle: bool,
     // The step a running slide commits when it lands.
     swipe_amount: isize,
+    /// Wheels arrive without gesture phases (the browser): no start or end
+    /// of a trackpad swipe or pinch, and momentum that looks like more
+    /// swiping. Swipes then land as soon as they are decisive, and a pinch
+    /// is a Ctrl-wheel run, which can close the viewer like a real pinch.
+    phaseless_wheels: bool,
+    wheel_pinch_last: Option<web_time::Instant>,
+    /// Phaseless only: the fastest and slowest wheel since the swipe landed.
+    /// Momentum only ever slows, so a wheel that has slowed well down and
+    /// then speeds up again (or turns) is the fingers starting a new swipe.
+    swipe_last_dx: f32,
+    swipe_peak: f32,
+    swipe_trough: f32,
     decoded_preview: Option<String>,
     // The photo shown last, and whether its preview was decoded when it
     // appeared (then it needs no fade from the thumbnail).
@@ -503,14 +556,21 @@ pub struct MittenApp {
     viewer_base: Option<Arc<RenderImage>>,
     closing: Option<ClosingPhoto>,
     closing_epoch: u64,
-    dismiss_guard: Option<std::time::Instant>,
+    dismiss_guard: Option<web_time::Instant>,
     pan_start: Option<Point<Pixels>>,
     zoom_input: Entity<InputState>,
     menu: Option<Point<Pixels>>,
     library_menu: bool,
+    /// Reconnecting to the library open last time, at start-up: shown as
+    /// "Loading library" rather than onboarding, which follows only if that fails.
+    restoring: bool,
+    /// The photo under the pointer this frame, recorded as tiles paint, for
+    /// the page's drag-out stand-in.
+    #[cfg(target_family = "wasm")]
+    drag_frame: std::rc::Rc<RefCell<Option<(String, Bounds<Pixels>)>>>,
     switcher_bounds: Bounds<Pixels>,
     notice_seen: String,
-    notice_until: Option<std::time::Instant>,
+    notice_until: Option<web_time::Instant>,
     settings_page: u8,
     marquee: Option<Marquee>,
     pending_delete: Vec<String>,
@@ -588,7 +648,7 @@ impl MittenApp {
                     }
                     this.sync_zoom(w, cx);
                     if matches!(event, InputEvent::PressEnter { .. }) {
-                        this.focus.focus(w);
+                        this.focus.focus(w, cx);
                     }
                     cx.notify();
                 }
@@ -610,7 +670,7 @@ impl MittenApp {
                 if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
                     this.save_caption(cx);
                     if matches!(event, InputEvent::PressEnter { .. }) {
-                        this.focus.focus(w);
+                        this.focus.focus(w, cx);
                     }
                 }
             }),
@@ -688,6 +748,8 @@ impl MittenApp {
             source_label: "Photos".into(),
             album_counts: Default::default(),
             provider_step: None,
+            #[cfg(feature = "remote")]
+            pinal_cancel: None,
             server,
             username,
             secret,
@@ -720,6 +782,11 @@ impl MittenApp {
             swipe_last: None,
             swipe_idle: false,
             swipe_amount: 0,
+            phaseless_wheels: cfg!(target_family = "wasm"),
+            wheel_pinch_last: None,
+            swipe_last_dx: 0.,
+            swipe_peak: 0.,
+            swipe_trough: 0.,
             decoded_preview: None,
             viewer_shown: None,
             opening: None,
@@ -739,6 +806,9 @@ impl MittenApp {
             zoom_input,
             menu: None,
             library_menu: false,
+            restoring: false,
+            #[cfg(target_family = "wasm")]
+            drag_frame: Default::default(),
             switcher_bounds: Bounds::default(),
             notice_seen: String::new(),
             notice_until: None,
@@ -775,7 +845,7 @@ impl MittenApp {
             _subscriptions: subscriptions,
         };
         this.theme(w, cx);
-        this.focus.focus(w);
+        this.focus.focus(w, cx);
         #[cfg(not(test))]
         {
             let weak = cx.weak_entity();
@@ -784,7 +854,63 @@ impl MittenApp {
                     .unwrap_or(true)
             });
         }
-        if let Some(path) = this.preferences.active.clone() {
+        // In the browser the library is the site's own (the signed-in
+        // account's), uploads made through the page are shown as they
+        // finish, and the page's news (copies, room in the topbar) is heard.
+        #[cfg(target_family = "wasm")]
+        {
+            if this.preferences.active.is_none() || !host::get().libraries {
+                this.connect(mitten::sources::web::source(), w, cx);
+                this.restoring = true;
+            }
+            cx.spawn_in(w, async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_millis(120)).await;
+                    if mitten::web::take_signed_out()
+                        && let Some(to) = &host::get().sign_in
+                    {
+                        browser::navigate(to);
+                    }
+                    let copied = browser::COPIED.lock().unwrap().take();
+                    let changed = browser::CHANGED.swap(false, std::sync::atomic::Ordering::Relaxed);
+                    if copied.is_some() || changed {
+                        let alive = this.update(cx, |this, cx| {
+                            if let Some(ok) = copied {
+                                this.notice = if ok { "Copied photo" } else { "Could not copy the photo" }.into();
+                            }
+                            cx.notify();
+                        });
+                        if alive.is_err() {
+                            break;
+                        }
+                    }
+                    let Some((done, total, failed)) = browser::UPLOADS.lock().unwrap().take() else {
+                        continue;
+                    };
+                    let alive = this.update_in(cx, |this, w, cx| {
+                        if done < total {
+                            this.notice = format!("Uploading {} of {total}…", done + 1).into();
+                        } else {
+                            this.notice = if failed > 0 {
+                                format!("{failed} of {total} couldn’t be uploaded")
+                            } else {
+                                format!("Uploaded {total} {}", if total == 1 { "photo" } else { "photos" })
+                            }
+                            .into();
+                            if let Some(driver) = &this.driver {
+                                this.connect(driver.source(), w, cx);
+                            }
+                        }
+                        cx.notify();
+                    });
+                    if alive.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+        if let Some(path) = this.preferences.active.clone().filter(|_| host::get().libraries) {
             let source = this
                 .preferences
                 .sources
@@ -796,10 +922,11 @@ impl MittenApp {
                     path,
                 });
             this.connect(source, w, cx);
+            this.restoring = true;
         }
         cx.spawn_in(w, async move |this, cx| {
             loop {
-                Timer::after(Duration::from_secs(5)).await;
+                cx.background_executor().timer(Duration::from_secs(5)).await;
                 if this
                     .update_in(cx, |this, w, cx| this.refresh(w, cx))
                     .is_err()
@@ -903,6 +1030,14 @@ impl MittenApp {
         );
         let c = self.colors(w);
         let theme = Theme::global_mut(cx);
+        // The browser has only the font Mitten brings.
+        #[cfg(target_family = "wasm")]
+        {
+            theme.font_family = FONT.into();
+            theme.mono_font_family = FONT.into();
+        }
+        #[cfg(target_family = "wasm")]
+        browser::theme(dark, c.accent);
         theme.colors.primary = rgb(c.accent).into();
         theme.colors.ring = rgb(c.accent).into();
         theme.colors.accent = rgb(c.soft).into();
@@ -958,8 +1093,18 @@ impl MittenApp {
                     && !self.failed.contains(&format!("{}-preview", p.fingerprint))
             })
     }
+    #[cfg_attr(target_family = "wasm", allow(unreachable_code, unused_variables))]
     fn remove_library(&mut self, source: Source, w: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
+            return;
+        }
+        // In the browser the library is the site's: removing it signs out.
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = (source, w, cx);
+            if let Some(to) = &host::get().sign_out {
+                browser::navigate(to);
+            }
             return;
         }
         self.busy = true;
@@ -1061,6 +1206,7 @@ impl MittenApp {
         cx: &mut Context<Self>,
     ) {
         self.busy = false;
+        self.restoring = false;
         match result {
             Ok((driver, page)) => {
                 let mut preferences = self.preferences.clone();
@@ -1124,7 +1270,7 @@ impl MittenApp {
                     e.set_placeholder("Search photos", w, cx);
                 });
                 self.reset_gallery();
-                self.focus.focus(w);
+                self.focus.focus(w, cx);
                 self.save_catalog_count();
                 self.load_more(cx);
                 self.measure_sizes(false, cx);
@@ -1191,6 +1337,7 @@ impl MittenApp {
         self.error = None;
         match provider {
             ProviderKind::Local => self.choose_folder(w, cx),
+            ProviderKind::Pinal => self.sign_in_pinal(w, cx),
             ProviderKind::Apple => {
                 let data = self
                     .config_path
@@ -1213,6 +1360,158 @@ impl MittenApp {
                 cx.notify();
             }
         }
+    }
+    /// Pinal Photos: sign in with Pinal Accounts in the browser, then open
+    /// the account's library from photos.pinal.tech.
+    fn sign_in_pinal(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(feature = "remote")]
+        {
+            use mitten::sources::pinal;
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.pinal_cancel = Some(cancel.clone());
+            self.busy = true;
+            self.error = None;
+            self.notice = "Signing in to Pinal…".into();
+            let data = self.config_path.parent().unwrap().to_owned();
+            cx.spawn_in(w, async move |this, cx| {
+                let started = cx.background_executor().offload(pinal::SignIn::start).await;
+                let sign_in = match started {
+                    Ok(sign_in) => sign_in,
+                    Err(e) => {
+                        let _ = this.update_in(cx, |this, w, cx| {
+                            this.pinal_cancel = None;
+                            this.finish_connection(Err(e), w, cx)
+                        });
+                        return;
+                    }
+                };
+                let _ = this.update(cx, |_, cx| cx.open_url(sign_in.url.as_str()));
+                let result = cx
+                    .background_executor()
+                    .offload(move || {
+                        let (refresh, who) = sign_in.finish(&cancel)?;
+                        let config = pinal::connection(&who);
+                        let source = config.source(&data)?;
+                        let provider = pinal::PinalPhotos::new(&config, &refresh, Some(source.clone()))?;
+                        let driver: Arc<dyn PhotosDriver> = Arc::new(
+                            mitten::sources::ConnectedPhotos::new(source, Box::new(provider))?,
+                        );
+                        let page = driver.page(None)?;
+                        pinal::save(&refresh, &who, &data)?;
+                        Ok::<_, anyhow::Error>((driver, page))
+                    })
+                    .await;
+                let _ = this.update_in(cx, |this, w, cx| {
+                    this.pinal_cancel = None;
+                    // Back from the browser.
+                    cx.activate(true);
+                    this.finish_connection(result, w, cx)
+                });
+            })
+            .detach();
+        }
+        #[cfg(not(feature = "remote"))]
+        {
+            let _ = w;
+            self.error = Some("Pinal Photos is not included in this build".into());
+        }
+        cx.notify();
+    }
+    fn cancel_pinal(&mut self, cx: &mut Context<Self>) {
+        #[cfg(feature = "remote")]
+        if let Some(cancel) = self.pinal_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        cx.notify();
+    }
+    /// Pinal Photos at the top of the services, like Pinal Mail in Picacho.
+    fn pinal_banner(&self, c: Colors, cx: &mut Context<Self>) -> AnyElement {
+        let available = ProviderKind::Pinal.available();
+        #[cfg(feature = "remote")]
+        let waiting = self.pinal_cancel.is_some();
+        #[cfg(not(feature = "remote"))]
+        let waiting = false;
+        div()
+            .id("connect-pinal-photos")
+            .debug_selector(|| "connect-pinal-photos".into())
+            .w_full()
+            .p_4()
+            .flex()
+            .items_center()
+            .gap_4()
+            .rounded(px(14.))
+            .border_1()
+            .border_color(rgb(c.accent))
+            .bg(rgb(c.soft))
+            .when(available && !self.busy, |d| {
+                d.cursor_pointer()
+                    .hover(|s| s.opacity(0.88))
+                    .active(|s| s.opacity(0.75))
+            })
+            .when(!available, |d| d.opacity(0.5))
+            .focusable()
+            .tab_index(0)
+            .child(pinal_tile(60., c))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(17.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Pinal Photos"),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .h(px(18.))
+                                    .flex()
+                                    .items_center()
+                                    .rounded_full()
+                                    .bg(rgb(c.accent))
+                                    .text_color(rgb(c.on_accent))
+                                    .text_size(px(10.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Recommended"),
+                            ),
+                    )
+                    .child(div().text_size(px(12.)).text_color(rgb(c.muted)).child(if waiting {
+                        "Finish signing in to Pinal in your browser…"
+                    } else if available {
+                        "Private photos designed for Mitten, also at photos.pinal.tech. Sign in once, with no passwords to copy."
+                    } else {
+                        "Unavailable in this build"
+                    })),
+            )
+            .child(if waiting {
+                ui::button("cancel-pinal-sign-in", c, false, true)
+                    .child("Cancel")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.cancel_pinal(cx);
+                    }))
+                    .into_any_element()
+            } else {
+                kit::glyph("next", 16., c.accent).into_any_element()
+            })
+            .on_click(cx.listener(|this, _, w, cx| this.choose_provider(ProviderKind::Pinal, w, cx)))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, w, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    cx.stop_propagation();
+                    this.choose_provider(ProviderKind::Pinal, w, cx);
+                }
+            }))
+            .into_any_element()
     }
     fn connect_remote(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let Some(provider) = self.provider_step else {
@@ -1287,7 +1586,7 @@ impl MittenApp {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx.background_executor().offload(move || {
-                let started=std::time::Instant::now();
+                let started=web_time::Instant::now();
                 let mut combined=PhotoPage::default(); let mut cursor=cursor; let mut visited=BTreeSet::new();
                 for _ in 0..16 {
                     if let Some(token)=&cursor { anyhow::ensure!(visited.insert(token.clone()),"Provider returned a repeated catalog cursor"); }
@@ -1353,7 +1652,15 @@ impl MittenApp {
             }
         }
     }
+    #[cfg_attr(target_family = "wasm", allow(unreachable_code, unused_variables))]
     fn choose_folder(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = w;
+            self.error = Some("Folders on this device open in the Mitten app, not in the browser.".into());
+            cx.notify();
+            return;
+        }
         let picker = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -1566,7 +1873,7 @@ impl MittenApp {
         self.anchor = None;
         self.modal = None;
         self.reset_gallery();
-        self.focus.focus(w);
+        self.focus.focus(w, cx);
         cx.notify();
     }
     fn current(&self) -> Option<Arc<Photo>> {
@@ -1630,7 +1937,7 @@ impl MittenApp {
             self.sync_zoom(w, cx);
             self.request_image(&photo, true, cx);
         }
-        self.focus.focus(w);
+        self.focus.focus(w, cx);
         cx.notify();
     }
     fn open_selected(&mut self, w: &mut Window, cx: &mut Context<Self>) {
@@ -1751,15 +2058,15 @@ impl MittenApp {
         self.pinch_armed = false;
         self.dismiss_pinch = None;
         self.sync_zoom(w, cx);
-        self.dismiss_guard = gesture.then(std::time::Instant::now);
-        self.focus.focus(w);
+        self.dismiss_guard = gesture.then(web_time::Instant::now);
+        self.focus.focus(w, cx);
         cx.notify();
     }
     fn block_dismissed_gesture(&mut self, started: bool) -> bool {
         let Some(last) = self.dismiss_guard else {
             return false;
         };
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         if started || now.duration_since(last) > Duration::from_millis(180) {
             self.dismiss_guard = None;
             false
@@ -1880,10 +2187,25 @@ impl MittenApp {
             .swipe_last
             .is_none_or(|last| now.duration_since(last) > Duration::from_millis(220));
         self.swipe_last = Some(now);
+        let previous = std::mem::replace(&mut self.swipe_last_dx, dx);
+        let landed = self.phaseless_wheels && (self.swipe_blocked || self.swipe_settling);
+        let fresh = landed
+            && dx.abs() >= 4.
+            && ((self.swipe_trough < self.swipe_peak * 0.5 && dx.abs() > self.swipe_trough * 2.)
+                || (previous.abs() >= 1. && dx.signum() != previous.signum()));
+        if landed && !fresh {
+            self.swipe_peak = self.swipe_peak.max(dx.abs());
+            self.swipe_trough = self.swipe_trough.min(dx.abs());
+        }
+        if fresh && self.swipe_settling {
+            // A new swipe during the slide: land it, then follow the fingers.
+            self.complete_swipe(w, cx);
+        }
         if self.swipe_settling {
             return;
         }
         if matches!(phase, TouchPhase::Started)
+            || fresh
             || (idle && !self.swipe_active && !matches!(phase, TouchPhase::Ended))
         {
             self.swipe_blocked = false;
@@ -1913,6 +2235,17 @@ impl MittenApp {
                 proposed.clamp(-self.viewport.viewport.0, self.viewport.viewport.0)
             };
             cx.notify();
+            // Without phases the fingers' lift can't be seen, and momentum
+            // keeps the wheel going: land on the neighbour once the swipe is
+            // decisive. Momentum then finds the swipe blocked until it stops,
+            // so one swipe moves one photo.
+            if self.phaseless_wheels
+                && !edge
+                && self.swipe_offset.abs() >= self.viewport.viewport.0.clamp(1., 600.) * 0.22
+            {
+                self.finish_viewer_swipe(w, cx);
+                return;
+            }
         }
         if matches!(phase, TouchPhase::Ended) {
             self.finish_viewer_swipe(w, cx);
@@ -1956,6 +2289,8 @@ impl MittenApp {
             return;
         }
         self.swipe_blocked = true;
+        self.swipe_peak = self.swipe_last_dx.abs();
+        self.swipe_trough = self.swipe_peak;
         let width = self.viewport.viewport.0.max(1.);
         let start = self.swipe_offset;
         let photos = self.visible(cx);
@@ -2209,7 +2544,14 @@ impl MittenApp {
             },
         );
     }
+    #[cfg_attr(target_family = "wasm", allow(unreachable_code, unused_variables))]
     fn import_picker(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = (w, cx);
+            browser::upload();
+            return;
+        }
         if self.driver.as_ref().is_some_and(|d| !d.can_import()) {
             self.error = Some("Import through the provider app, or choose a local folder.".into());
             cx.notify();
@@ -2250,6 +2592,91 @@ impl MittenApp {
             |this, _| this.notice = "Favorites updated".into(),
         );
     }
+    /// In the browser: a photo (tile, or the viewer) records its painted
+    /// bounds while it is under the pointer, and is redrawn as the pointer
+    /// comes and goes, so the page's drag-out stand-in follows.
+    #[cfg_attr(not(target_family = "wasm"), allow(unused_variables))]
+    fn drag_probe(&self, d: Stateful<Div>, id: &str, cx: &mut Context<Self>) -> Stateful<Div> {
+        #[cfg(target_family = "wasm")]
+        {
+            let frame = self.drag_frame.clone();
+            let id = id.to_owned();
+            return d
+                .on_hover(cx.listener(|_, _: &bool, _, cx| cx.notify()))
+                .child(
+                    canvas(
+                        move |bounds, w, _| {
+                            if bounds.contains(&w.mouse_position()) {
+                                *frame.borrow_mut() = Some((id, bounds));
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0(),
+                );
+        }
+        #[cfg(not(target_family = "wasm"))]
+        d
+    }
+    /// What dragging out from under the pointer carries: the photo there, or
+    /// the whole selection when it is part of it (in the gallery).
+    #[cfg(target_family = "wasm")]
+    fn drag_target(&self, id: &str, bounds: Bounds<Pixels>) -> Option<browser::DragTarget> {
+        if self.modal.is_some() || self.menu.is_some() || self.library_menu || self.filter == Filter::Trash {
+            return None;
+        }
+        let driver = self.driver.as_ref()?;
+        let find = |id: &str| {
+            self.photo_index
+                .get(id)
+                .and_then(|&i| self.library.photos.get(i))
+                .cloned()
+        };
+        let under = find(id)?;
+        let mut photos = vec![under.clone()];
+        if self.viewer.is_none() && self.selected.contains(id) {
+            photos.extend(self.selected.iter().filter(|s| *s != id).filter_map(|s| find(s)).take(99));
+        }
+        let names = mitten::drag_export::filenames(photos.iter().map(|p| p.name.as_str()));
+        let photos = photos
+            .iter()
+            .zip(names)
+            .filter_map(|(p, name)| {
+                let kind = if p.duration.is_some() {
+                    "video/mp4"
+                } else {
+                    match name.rsplit('.').next().map(str::to_ascii_lowercase).as_deref() {
+                        Some("png") => "image/png",
+                        Some("gif") => "image/gif",
+                        Some("webp") => "image/webp",
+                        Some("heic" | "heif") => "image/heic",
+                        Some("avif") => "image/avif",
+                        Some("tif" | "tiff") => "image/tiff",
+                        _ => "image/jpeg",
+                    }
+                };
+                Some(browser::DragPhoto {
+                    url: driver.preview(p).ok()?.to_string_lossy().into_owned(),
+                    download: driver.download_url(p),
+                    name,
+                    kind: kind.into(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let preview = driver.thumbnail(&under).ok()?.to_string_lossy().into_owned();
+        Some(browser::DragTarget {
+            bounds: (
+                bounds.origin.x.into(),
+                bounds.origin.y.into(),
+                bounds.size.width.into(),
+                bounds.size.height.into(),
+            ),
+            photos,
+            preview,
+        })
+    }
+    #[cfg_attr(target_family = "wasm", allow(unreachable_code))]
     fn copy_selected(&mut self, cx: &mut Context<Self>) {
         if self.modal.is_some() || self.filter == Filter::Trash {
             return;
@@ -2269,6 +2696,19 @@ impl MittenApp {
             .collect();
         let count = photos.len();
         if count == 0 {
+            return;
+        }
+        // In the browser: one picture, as PNG (all a web page can copy).
+        #[cfg(target_family = "wasm")]
+        {
+            let url = driver.preview(&photos[0]).ok();
+            self.notice = match url {
+                Some(url) if browser::copy(&url.to_string_lossy()) => {
+                    if count == 1 { "Copying photo…".into() } else { "Copying the first photo…".into() }
+                }
+                _ => "This browser can’t copy photos".into(),
+            };
+            cx.notify();
             return;
         }
         self.notice = if native_drag::copy(driver, photos) {
@@ -2347,7 +2787,7 @@ impl MittenApp {
                 e.focus(w, cx);
             });
         } else {
-            self.focus.focus(w);
+            self.focus.focus(w, cx);
         }
         cx.notify();
     }
@@ -2390,8 +2830,16 @@ impl MittenApp {
             },
         );
     }
+    #[cfg_attr(target_family = "wasm", allow(unreachable_code, unused_variables))]
     fn export_picker(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         if self.selected.is_empty() {
+            return;
+        }
+        // The browser saves originals to its downloads.
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = (w, cx);
+            browser::download(self.selected.iter().map(|id| wasm_bindgen::JsValue::from(id.as_str())).collect());
             return;
         }
         let ids = self.selected.iter().cloned().collect::<Vec<_>>();
@@ -2631,7 +3079,7 @@ impl MittenApp {
             .p_2()
             .bg(rgb(c.bg))
             .rounded_bl(corner)
-            .child(self.library_switcher(c, cx))
+            .when(host::get().libraries, |d| d.child(self.library_switcher(c, cx)))
             .child(
                 kit::nav_item(
                     "library",
@@ -2771,19 +3219,21 @@ impl MittenApp {
                     )
                     .on_click(cx.listener(|this, _, w, cx| this.set_filter(Filter::Trash, w, cx))),
                 )
-                .child(
-                    div()
-                        .mt_2()
-                        .pt_2()
-                        .border_t_1()
-                        .border_color(rgb(c.border))
-                        .child(
-                            kit::nav_item("sources", "drive", "Photo sources", None, false, c)
-                                .on_click(cx.listener(|this, _, w, cx| {
-                                    this.open_modal(Modal::Sources, w, cx)
-                                })),
-                        ),
-                );
+                .when(host::get().libraries, |side| {
+                    side.child(
+                        div()
+                            .mt_2()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(rgb(c.border))
+                            .child(
+                                kit::nav_item("sources", "drive", "Photo sources", None, false, c)
+                                    .on_click(cx.listener(|this, _, w, cx| {
+                                        this.open_modal(Modal::Sources, w, cx)
+                                    })),
+                            ),
+                    )
+                });
         side
     }
     fn prepare_photo_drag(&self, drag: &DragPhotos) {
@@ -2921,6 +3371,7 @@ impl MittenApp {
                     .left(px(frame.x))
                     .top(px(frame.y))
                     .group("photo-tile")
+                    .map(|d| self.drag_probe(d, &photo.id, cx))
                     .w(px(frame.w))
                     .h(px(frame.h))
                     .rounded(px(layout.radius))
@@ -2955,7 +3406,7 @@ impl MittenApp {
                         )
                     })
                     .child(if let Some(path) = thumb {
-                        img(Arc::<std::path::Path>::from(path))
+                        img(crate::ui::image_source(&path))
                             .image_cache(&self.render_cache)
                             .size_full()
                             .object_fit(ObjectFit::Cover)
@@ -2984,7 +3435,7 @@ impl MittenApp {
                     .when_some(motion, |d, path| {
                         // Moving photos play in large tiles.
                         d.child(
-                            img(Arc::<std::path::Path>::from(path))
+                            img(crate::ui::image_source(&path))
                                 .image_cache(&self.motion_cache)
                                 .absolute()
                                 .inset_0()
@@ -3055,7 +3506,7 @@ impl MittenApp {
                                 this.select(index, false, Modifiers::none(), w, cx);
                             }
                             this.menu = Some(e.position);
-                            this.focus.focus(w);
+                            this.focus.focus(w, cx);
                             cx.notify();
                         }),
                     )
@@ -3517,7 +3968,7 @@ impl MittenApp {
                     if !decode.is_empty() {
                         this.render_cache.update(cx, |cache, cx| {
                             for path in decode {
-                                let _ = cache.load(&Resource::from(path), w, cx);
+                                let _ = cache.load(&crate::ui::image_resource(&path), w, cx);
                             }
                         });
                     }
@@ -3685,7 +4136,7 @@ impl MittenApp {
                         size(px(width), px(height)),
                     );
                     w.paint_quad(fill(badge, rgba(0x0000008c)).corner_radii(px(height / 2.)));
-                    let _ = line.paint(badge.origin + point(px(pad_x), px(0.)), px(height), w, cx);
+                    let _ = line.paint(badge.origin + point(px(pad_x), px(0.)), px(height), TextAlign::Left, None, w, cx);
                 }
             },
         )
@@ -3791,11 +4242,11 @@ impl MittenApp {
     /// one per notch; a trackpad as soon as the fingers move, then after each
     /// further stretch of travel the same way. Turning around steps back as
     /// promptly as the first step.
-    fn scroll_zoom(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) -> bool {
+    fn scroll_zoom(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) -> bool {
         if self.viewer.is_some() || self.modal.is_some() {
             return false;
         }
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         match event.delta {
             ScrollDelta::Lines(lines) => {
                 if lines.y != 0. {
@@ -4126,7 +4577,7 @@ impl MittenApp {
                             .child(
                                 Scrollbar::vertical(&self.scroll)
                                     .id("gallery-scrollbar")
-                                    .scrollbar_show(ScrollbarShow::Always),
+                                    .mode(ScrollbarMode::Always),
                             ),
                     )
                     .when(layout.dense() && !layout.sectioned(), |d| {
@@ -4192,7 +4643,7 @@ impl MittenApp {
                 |_, _, _| (),
                 move |bounds, _, w, _| {
                     let entity = zoom_entity.clone();
-                    w.on_mouse_event(move |event: &ScrollWheelEvent, phase, _, cx| {
+                    w.on_mouse_event(move |event: &ScrollEvent, phase, _, cx| {
                         if phase != DispatchPhase::Capture
                             || !(event.modifiers.platform || event.modifiers.control)
                             || !bounds.contains(&event.position)
@@ -4210,7 +4661,7 @@ impl MittenApp {
             .inset_0(),
         );
         content
-            .on_scroll_wheel(cx.listener(|this, _: &ScrollWheelEvent, _, cx| {
+            .on_scroll(cx.listener(|this, _: &ScrollEvent, _, cx| {
                 if this.gallery_zoom.is_some() {
                     this.finish_zoom(cx);
                     cx.notify();
@@ -4222,7 +4673,7 @@ impl MittenApp {
                     if this.modal.is_some() {
                         return;
                     }
-                    this.focus.focus(w);
+                    this.focus.focus(w, cx);
                     // Dense grids are painted, so they are hit-tested here.
                     if let Some(index) = this.dense_hit(e.position, cx) {
                         this.select(index, e.click_count == 2, e.modifiers, w, cx);
@@ -4262,7 +4713,7 @@ impl MittenApp {
                         this.select(index, false, Modifiers::none(), w, cx);
                     }
                     this.menu = Some(e.position);
-                    this.focus.focus(w);
+                    this.focus.focus(w, cx);
                     cx.notify();
                 }),
             )
@@ -4327,12 +4778,12 @@ impl MittenApp {
             let thumbnail = thumbnail_path
                 .and_then(|path| {
                     self.render_cache
-                        .update(cx, |cache, cx| cache.load(&Resource::from(path), w, cx))
+                        .update(cx, |cache, cx| cache.load(&crate::ui::image_resource(&path), w, cx))
                 })
                 .and_then(|result| result.ok());
             let preview = preview_path.and_then(|path| {
                 self.viewer_render_cache
-                    .update(cx, |cache, cx| cache.load(&Resource::from(path), w, cx))
+                    .update(cx, |cache, cx| cache.load(&crate::ui::image_resource(&path), w, cx))
             });
             let preview = match preview {
                 Some(Ok(image)) => {
@@ -4394,7 +4845,7 @@ impl MittenApp {
                     match self.previews.get(&neighbour.fingerprint).cloned() {
                         Some(path) => {
                             self.viewer_render_cache
-                                .update(cx, |cache, cx| cache.load(&Resource::from(path), w, cx));
+                                .update(cx, |cache, cx| cache.load(&crate::ui::image_resource(&path), w, cx));
                         }
                         None if !self.pending.iter().any(|k| k.ends_with("-preview")) => {
                             self.request_image(&neighbour, true, cx)
@@ -4615,7 +5066,7 @@ impl MittenApp {
                                 .when_some(motion, |d, path| {
                                     // GIFs and animated WebPs play over their still.
                                     d.child(
-                                        img(Arc::<std::path::Path>::from(path))
+                                        img(crate::ui::image_source(&path))
                                             .image_cache(&self.motion_cache)
                                             .absolute()
                                             .inset_0()
@@ -4775,7 +5226,7 @@ impl MittenApp {
                             self.request_image(&photo, false, cx);
                             if let Some(path) = self.thumbnails.get(&photo.fingerprint).cloned() {
                                 return d.child(
-                                    img(Arc::<std::path::Path>::from(path))
+                                    img(crate::ui::image_source(&path))
                                         .image_cache(&self.render_cache)
                                         .absolute()
                                         .left(left)
@@ -4825,12 +5276,25 @@ impl MittenApp {
                                 }
                             })),
                     )
-                    .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, w, cx| {
+                    .on_scroll(cx.listener(|this, e: &ScrollEvent, w, cx| {
                         if this.modal.is_some() {
                             return;
                         }
                         let delta = e.delta.pixel_delta(px(28.));
-                        if e.modifiers.platform || e.modifiers.control {
+                        if this.phaseless_wheels && e.modifiers.control && !e.modifiers.platform {
+                            // A trackpad pinch, as browsers report it.
+                            let now = cx.background_executor().now();
+                            if this
+                                .wheel_pinch_last
+                                .is_none_or(|last| now.duration_since(last) > Duration::from_millis(250))
+                            {
+                                this.viewer_pinch_began();
+                            }
+                            this.wheel_pinch_last = Some(now);
+                            let at = e.position - this.viewer_bounds.center();
+                            let factor = (f32::from(delta.y) * 0.006).exp();
+                            this.viewer_pinch(factor - 1., (at.x.into(), at.y.into()), w, cx);
+                        } else if e.modifiers.platform || e.modifiers.control {
                             let at = e.position - this.viewer_bounds.center();
                             this.set_viewer_zoom(
                                 this.viewport.zoom * (f32::from(delta.y) * 0.006).exp(),
@@ -4871,7 +5335,7 @@ impl MittenApp {
                             if this.can_pan() {
                                 this.pan_start = Some(e.position);
                             }
-                            this.focus.focus(w);
+                            this.focus.focus(w, cx);
                             cx.stop_propagation();
                             cx.notify();
                         }),
@@ -4901,6 +5365,7 @@ impl MittenApp {
                         }),
                     )
                     .when(!self.can_pan(), |canvas| {
+                        let canvas = self.drag_probe(canvas, &photo.id, cx);
                         let drag = DragPhotos {
                             ids: Default::default(),
                             seed: photo.id.clone(),
@@ -5026,7 +5491,7 @@ impl MittenApp {
     fn visible_notice(&mut self, cx: &mut Context<Self>) -> Option<String> {
         if self.notice != self.notice_seen {
             self.notice_seen = self.notice.clone();
-            self.notice_until = Some(std::time::Instant::now() + NOTICE_TIME);
+            self.notice_until = Some(web_time::Instant::now() + NOTICE_TIME);
             cx.spawn(async move |this, cx| {
                 cx.background_executor()
                     .timer(NOTICE_TIME + Duration::from_millis(20))
@@ -5039,7 +5504,7 @@ impl MittenApp {
             && !self.notice.is_empty()
             && self
                 .notice_until
-                .is_some_and(|until| std::time::Instant::now() < until);
+                .is_some_and(|until| web_time::Instant::now() < until);
         shown.then(|| self.notice.clone())
     }
     fn source_choices(&self, w: &Window, c: Colors, cx: &mut Context<Self>) -> Div {
@@ -5111,6 +5576,7 @@ impl MittenApp {
                     .child("Connecting to your library…"),
             );
         }
+        content = content.child(self.pinal_banner(c, cx));
         let grid = div()
             .id("provider-grid")
             .debug_selector(|| "provider-grid".into())
@@ -5122,7 +5588,7 @@ impl MittenApp {
                 2
             })
             .gap_2()
-            .children(ProviderKind::ALL.into_iter().map(|provider| {
+            .children(ProviderKind::ALL.into_iter().filter(|p| *p != ProviderKind::Pinal && (p.available() || cfg!(not(target_family = "wasm")))).map(|provider| {
                 let id = format!("connect-{}", provider.id());
                 let available = provider.available();
                 div()
@@ -5278,11 +5744,13 @@ impl MittenApp {
             .flex()
             .flex_col()
             .gap_3();
+        // Without library settings (a site's own library), Settings opens on Appearance.
+        let settings_page = if host::get().libraries { self.settings_page } else { self.settings_page.max(1) };
         match modal {
             Modal::Sources => {
-                if self.settings_page == 0 {
+                if settings_page == 0 {
                     content = content.child(self.source_choices(w, c, cx));
-                } else if self.settings_page == 1 {
+                } else if settings_page == 1 {
                     content = content.child(self.appearance_page(w, c, cx));
                 } else {
                     content = content.child(self.behavior_page(c, cx));
@@ -5313,7 +5781,7 @@ impl MittenApp {
                                     .on_click(cx.listener(|this, _, w, cx| {
                                         this.modal = None;
                                         this.pending_delete.clear();
-                                        this.focus.focus(w);
+                                        this.focus.focus(w, cx);
                                         cx.notify();
                                     })),
                             )
@@ -5403,27 +5871,29 @@ impl MittenApp {
         let content = if modal == Modal::Sources {
             let narrow = ui::settings_narrow(w);
             let nav = ui::settings_nav(c, narrow)
-                .child(
-                    kit::nav_item(
-                        "settings-libraries",
-                        "folder",
-                        "Libraries",
-                        None,
-                        self.settings_page == 0,
-                        c,
+                .when(host::get().libraries, |nav| {
+                    nav.child(
+                        kit::nav_item(
+                            "settings-libraries",
+                            "folder",
+                            "Libraries",
+                            None,
+                            settings_page == 0,
+                            c,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.settings_page = 0;
+                            cx.notify();
+                        })),
                     )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.settings_page = 0;
-                        cx.notify();
-                    })),
-                )
+                })
                 .child(
                     kit::nav_item(
                         "settings-appearance",
                         "eye",
                         "Appearance",
                         None,
-                        self.settings_page == 1,
+                        settings_page == 1,
                         c,
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -5437,7 +5907,7 @@ impl MittenApp {
                         "settings",
                         "Behavior",
                         None,
-                        self.settings_page == 2,
+                        settings_page == 2,
                         c,
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -5466,14 +5936,14 @@ impl MittenApp {
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, w, cx| {
                 if event.keystroke.key == "escape" {
                     this.modal = None;
-                    this.focus.focus(w);
+                    this.focus.focus(w, cx);
                     cx.stop_propagation();
                     cx.notify();
                 } else if event.keystroke.key == "tab" && this.provider_step.is_none() {
                     if this.modal == Some(Modal::Album) {
                         this.name.update(cx, |e, cx| e.focus(w, cx));
                     } else {
-                        this.focus.focus(w);
+                        this.focus.focus(w, cx);
                     }
                     cx.stop_propagation();
                 }
@@ -5495,7 +5965,7 @@ impl MittenApp {
                         kit::tool("close-modal", "close", "Close", c).on_click(cx.listener(
                             |this, _, w, cx| {
                                 this.modal = None;
-                                this.focus.focus(w);
+                                this.focus.focus(w, cx);
                                 cx.notify();
                             },
                         )),
@@ -5603,9 +6073,11 @@ trait Offload {
 }
 impl Offload for BackgroundExecutor {
     fn offload<T: Send + 'static>(&self, work: impl FnOnce() -> T + Send + 'static) -> Task<T> {
-        #[cfg(test)]
+        // In the browser there is no thread pool of its own to start: the
+        // work runs on GPUI's Web Workers, where blocking requests are allowed.
+        #[cfg(any(test, target_family = "wasm"))]
         return self.spawn(async move { work() });
-        #[cfg(not(test))]
+        #[cfg(not(any(test, target_family = "wasm")))]
         self.spawn(blocking::unblock(work))
     }
 }
@@ -5666,7 +6138,7 @@ impl Render for MittenApp {
                     |_, _, _| (),
                     move |_, _, w, _| {
                         let entity = guard_entity.clone();
-                        w.on_mouse_event(move |event: &ScrollWheelEvent, phase, _, cx| {
+                        w.on_mouse_event(move |event: &ScrollEvent, phase, _, cx| {
                             if phase == DispatchPhase::Capture {
                                 let blocked = entity
                                     .update(cx, |this, _| {
@@ -5703,14 +6175,14 @@ impl Render for MittenApp {
                 if this.modal.is_some() {
                     if event.keystroke.key == "escape" {
                         this.modal = None;
-                        this.focus.focus(w);
+                        this.focus.focus(w, cx);
                         cx.stop_propagation();
                         cx.notify();
                     } else if event.keystroke.key == "tab" && this.modal == Some(Modal::Album) {
                         if this.modal == Some(Modal::Album) {
                             this.name.update(cx, |e, cx| e.focus(w, cx));
                         } else {
-                            this.focus.focus(w);
+                            this.focus.focus(w, cx);
                         }
                         cx.stop_propagation();
                     }
@@ -5750,7 +6222,7 @@ impl Render for MittenApp {
                         this.selected.clear();
                     }
                 }
-                this.focus.focus(w);
+                this.focus.focus(w, cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &Next, w, cx| this.animate_step(1, w, cx)))
@@ -5789,7 +6261,9 @@ impl Render for MittenApp {
                 this.import_paths(paths.paths().to_vec(), w, cx)
             }))
             .drag_over::<ExternalPaths>(move |s, _, _, _| s.border_2().border_color(rgb(c.accent)));
+        let host = host::get();
         let mut bar = ui::topbar("topbar", c, true)
+            .h(px(host.topbar_height))
             .child(
                 kit::tool("toggle-sidebar", "sidebar", "Library & albums", c).on_click(
                     cx.listener(move |this, _, w, cx| {
@@ -5802,7 +6276,7 @@ impl Render for MittenApp {
                     }),
                 ),
             )
-            .child(ui::app_brand("brand/mitten.svg", "Mitten", width >= 480.))
+            .child(topbar_brand(host, width >= 480.))
             .child(div().flex_1());
         if let Some((label, progress)) = self.loading_status() {
             bar = bar.child(progress::indicator(label, progress, width >= 700., c));
@@ -5842,10 +6316,18 @@ impl Render for MittenApp {
                     ))
                 })
                 .child(
-                    kit::tool("settings", "settings", "Libraries & appearance · ⌘,", c).on_click(
-                        cx.listener(|this, _, w, cx| this.open_modal(Modal::Sources, w, cx)),
-                    ),
-                );
+                    kit::tool(
+                        "settings",
+                        "settings",
+                        if host.libraries { "Libraries & appearance · ⌘," } else { "Settings · ⌘," },
+                        c,
+                    )
+                    .on_click(cx.listener(|this, _, w, cx| this.open_modal(Modal::Sources, w, cx))),
+                )
+                // The site's own controls are drawn over this end of the bar.
+                .when(host::topbar_inset() > 0., |bar| {
+                    bar.child(div().flex_shrink_0().w(px(host::topbar_inset())))
+                });
         let close = cx.listener(|this, _: &ClickEvent, w, cx| {
             if this.allow_close(cx) {
                 w.remove_window();
@@ -5876,7 +6358,9 @@ impl Render for MittenApp {
                     ),
             );
         }
-        if self.driver.is_none() {
+        if self.driver.is_none() && self.restoring {
+            root = root.child(restoring_view(c));
+        } else if self.driver.is_none() {
             root = root.child(
                 div()
                     .id("onboarding-scroll")
@@ -6205,31 +6689,57 @@ impl Render for MittenApp {
             root = root.child(self.library_menu_view(w, c, cx));
         }
         self.sync_video(w);
+        #[cfg(target_family = "wasm")]
+        {
+            // Last, after the tiles have recorded what's under the pointer.
+            let frame = self.drag_frame.clone();
+            let entity = cx.weak_entity();
+            root = root.child(
+                canvas(
+                    move |_, _, cx| {
+                        let hit = frame.borrow_mut().take();
+                        let target = hit.and_then(|(id, bounds)| {
+                            entity.upgrade()?.read(cx).drag_target(&id, bounds)
+                        });
+                        browser::drag_target(target);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_0(),
+            );
+        }
         root
     }
 }
+/// Shortcuts are built once at launch from the platform's modifier; GPUI
+/// keeps their text for the life of the app.
+fn shortcut(text: String) -> &'static str {
+    Box::leak(text.into_boxed_str())
+}
 fn register_shortcuts(cx: &mut App) {
-    let key = if cfg!(target_os = "macos") {
-        "cmd"
-    } else {
-        "ctrl"
-    };
+    // In the browser, the computer the page runs on decides.
+    #[cfg(target_family = "wasm")]
+    let mac = browser::is_mac();
+    #[cfg(not(target_family = "wasm"))]
+    let mac = cfg!(target_os = "macos");
+    let key = if mac { "cmd" } else { "ctrl" };
     cx.bind_keys([
-        KeyBinding::new(&format!("{key}-i"), Import, Some("Photos")),
-        KeyBinding::new(&format!("{key}-o"), OpenFolder, Some("Photos")),
-        KeyBinding::new(&format!("{key}-,"), Settings, Some("Photos")),
-        KeyBinding::new(&format!("{key}-f"), Find, Some("Photos")),
-        KeyBinding::new(&format!("{key}-a"), SelectAll, Some("Photos && !Input")),
-        KeyBinding::new(&format!("{key}-n"), NewAlbum, Some("Photos")),
-        KeyBinding::new(&format!("{key}-q"), Quit, Some("Photos")),
-        KeyBinding::new(&format!("{key}-w"), CloseWindow, Some("Photos")),
-        KeyBinding::new(&format!("{key}-m"), Minimize, Some("Photos")),
+        KeyBinding::new(shortcut(format!("{key}-i")), Import, Some("Photos")),
+        KeyBinding::new(shortcut(format!("{key}-o")), OpenFolder, Some("Photos")),
+        KeyBinding::new(shortcut(format!("{key}-,")), Settings, Some("Photos")),
+        KeyBinding::new(shortcut(format!("{key}-f")), Find, Some("Photos")),
+        KeyBinding::new(shortcut(format!("{key}-a")), SelectAll, Some("Photos && !Input")),
+        KeyBinding::new(shortcut(format!("{key}-n")), NewAlbum, Some("Photos")),
+        KeyBinding::new(shortcut(format!("{key}-q")), Quit, Some("Photos")),
+        KeyBinding::new(shortcut(format!("{key}-w")), CloseWindow, Some("Photos")),
+        KeyBinding::new(shortcut(format!("{key}-m")), Minimize, Some("Photos")),
         KeyBinding::new("cmd-h", Hide, None),
         KeyBinding::new("cmd-alt-h", HideOthers, None),
-        KeyBinding::new(&format!("{key}-="), ZoomIn, Some("Photos && !Input")),
-        KeyBinding::new(&format!("{key}-+"), ZoomIn, Some("Photos && !Input")),
-        KeyBinding::new(&format!("{key}--"), ZoomOut, Some("Photos && !Input")),
-        KeyBinding::new(&format!("{key}-0"), FitPhoto, Some("Photos && !Input")),
+        KeyBinding::new(shortcut(format!("{key}-=")), ZoomIn, Some("Photos && !Input")),
+        KeyBinding::new(shortcut(format!("{key}-+")), ZoomIn, Some("Photos && !Input")),
+        KeyBinding::new(shortcut(format!("{key}--")), ZoomOut, Some("Photos && !Input")),
+        KeyBinding::new(shortcut(format!("{key}-0")), FitPhoto, Some("Photos && !Input")),
         KeyBinding::new("space", OpenSelected, Some("Photos && !Input")),
         KeyBinding::new("enter", OpenSelected, Some("Photos && !Input")),
         KeyBinding::new("escape", Back, Some("Photos")),
@@ -6238,32 +6748,124 @@ fn register_shortcuts(cx: &mut App) {
         KeyBinding::new("backspace", Delete, Some("Photos && !Input")),
         KeyBinding::new("delete", Delete, Some("Photos && !Input")),
         KeyBinding::new("f", Favorite, Some("Photos && !Input")),
-        KeyBinding::new(&format!("{key}-c"), CopyPhotos, Some("Photos && !Input")),
+        KeyBinding::new(shortcut(format!("{key}-c")), CopyPhotos, Some("Photos && !Input")),
     ]);
 }
 
+/// While the library open last time reconnects: a spinner, not onboarding.
+fn restoring_view(c: Colors) -> Stateful<Div> {
+    use gpui_component::Sizable as _;
+    div()
+        .id("restoring-library")
+        .debug_selector(|| "restoring-library".into())
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_3()
+        .child(
+            gpui_component::spinner::Spinner::new()
+                .color(rgb(c.accent).into())
+                .with_size(px(26.)),
+        )
+        .child(
+            div()
+                .text_size(px(13.))
+                .text_color(rgb(c.muted))
+                .child("Loading libraries…"),
+        )
+}
+/// The topbar's logo and name: Mitten's, or the site's around it in a browser.
+/// Scaled with the bar, so a taller bar keeps it in proportion.
+fn topbar_brand(host: &host::Host, show_name: bool) -> Div {
+    let scale = (host.topbar_height / ui::metrics::TITLEBAR).clamp(1., 1.4);
+    div()
+        .debug_selector(|| "app-brand".into())
+        .flex()
+        .items_center()
+        .flex_shrink_0()
+        .ml(px(6.))
+        .child(img(host.brand_icon.clone()).w(px(20. * scale)).h(px(17. * scale)))
+        .when(show_name, |d| {
+            d.child(
+                div()
+                    .ml(px(4. * scale))
+                    .text_size(px(13. * scale.min(1.15)))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(host.brand_name.clone()),
+            )
+        })
+}
 /// Give a text field the window background explicitly: the theme's
 /// background is transparent on Linux so `Root` doesn't paint past the
 /// rounded window corners, and inputs would otherwise inherit that.
 pub(crate) fn field(input: Input, c: Colors) -> Input {
     input.bg(rgb(c.bg))
 }
-pub fn run() -> anyhow::Result<()> {
+#[cfg(not(target_family = "wasm"))]
+fn application() -> anyhow::Result<(Application, PathBuf)> {
     let project = directories::ProjectDirs::from("tech", "pinal", "mitten")
         .ok_or_else(|| anyhow::anyhow!("Cannot locate application data"))?;
     let data = std::env::var_os("MITTEN_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| project.data_dir().into());
     std::fs::create_dir_all(&data)?;
-    Application::new()
-        .with_assets(assets::Assets)
-        .run(move |cx| {
+    Ok((gpui_platform::application(), data))
+}
+/// In the browser (photos.pinal.tech): GPUI's web platform with its worker
+/// threads, the page's own fetch (and sign-in cookie) for images, and
+/// settings kept in the browser under this name.
+#[cfg(target_family = "wasm")]
+fn application() -> anyhow::Result<(Application, PathBuf)> {
+    gpui_platform::web_init();
+    browser::report_panics();
+    mitten::web::origin();
+    let app = gpui_platform::application();
+    let http = gpui_web::FetchHttpClient::new(app.foreground_executor().to_send());
+    Ok((app.with_http_client(Arc::new(http)), PathBuf::from("/mitten")))
+}
+/// The browser has no system fonts for GPUI: Mitten brings Inter.
+#[cfg(target_family = "wasm")]
+const FONT: &str = "Inter Variable";
+
+pub fn run() -> anyhow::Result<()> {
+    let (app, data) = application()?;
+    let app = app.with_assets(assets::Assets);
+    // Pinal's sign-in page hands the bundled app its answer as mitten://.
+    #[cfg(feature = "remote")]
+    app.on_open_urls(mitten::sources::pinal::opened);
+    app.run(move |cx| {
+            #[cfg(target_family = "wasm")]
+            {
+                // Inter for Mitten's own text; Noto Sans because it is on
+                // GPUI's list of last-resort fonts, for text that names none.
+                let fonts = vec![
+                    std::borrow::Cow::Borrowed(
+                        include_bytes!("../assets/fonts/InterVariable.ttf").as_slice(),
+                    ),
+                    std::borrow::Cow::Borrowed(
+                        include_bytes!("../assets/fonts/NotoSans-Regular.ttf").as_slice(),
+                    ),
+                ];
+                if let Err(e) = cx.text_system().add_fonts(fonts) {
+                    eprintln!("Mitten could not load its font: {e:#}");
+                }
+            }
             ui::init(cx);
+            #[cfg(target_family = "wasm")]
+            {
+                let theme = gpui_component::Theme::global_mut(cx);
+                theme.font_family = FONT.into();
+                theme.mono_font_family = FONT.into();
+            }
             cx.on_action(|_: &Hide, cx| cx.hide());
             cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
             register_shortcuts(cx);
             cx.set_menus(vec![
                 Menu {
+                    disabled: false,
                     name: "Mitten".into(),
                     items: vec![
                         MenuItem::action("Settings…", Settings),
@@ -6275,6 +6877,7 @@ pub fn run() -> anyhow::Result<()> {
                     ],
                 },
                 Menu {
+                    disabled: false,
                     name: "File".into(),
                     items: vec![
                         MenuItem::action("Import…", Import),
@@ -6284,6 +6887,7 @@ pub fn run() -> anyhow::Result<()> {
                     ],
                 },
                 Menu {
+                    disabled: false,
                     name: "View".into(),
                     items: vec![
                         MenuItem::action("Search", Find),
@@ -6317,12 +6921,15 @@ pub fn run() -> anyhow::Result<()> {
                 |w, cx| {
                     ui::native_titlebar::install(w);
                     ui::native_transfer::install_magnify(w);
+                    // The page's loading screen gives way once the window has drawn.
+                    #[cfg(target_family = "wasm")]
+                    w.on_next_frame(|_, _| browser::ready());
                     let view = cx.new(|cx| MittenApp::new(data.join("settings.json"), w, cx));
                     cx.new(|cx| Root::new(view, w, cx))
                 },
             )
             .expect("Cannot open the Mitten window");
-            cx.on_window_closed(|cx| {
+            cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();
                 }

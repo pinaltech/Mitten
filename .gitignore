@@ -19,3 +19,7 @@
 
 # Local app profiles / test data
 .mitten/
+
+# Mitten web: the wasm build output
+/target/wasm/
+/web/dist/

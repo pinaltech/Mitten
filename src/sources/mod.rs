@@ -18,6 +18,11 @@ mod apple;
 #[cfg(all(target_os = "macos", feature = "apple-photos"))]
 pub use apple::verify_configuration as verify_photokit_configuration;
 #[cfg(feature = "remote")]
+pub mod pinal;
+pub mod pinal_api;
+#[cfg(target_family = "wasm")]
+pub mod web;
+#[cfg(feature = "remote")]
 pub mod remote;
 
 #[derive(Default)]
@@ -33,15 +38,18 @@ pub enum ProviderKind {
     Apple,
     Immich,
     Nextcloud,
+    /// Pinal Photos: a Pinal account's library at photos.pinal.tech.
+    Pinal,
 }
 impl ProviderKind {
-    pub const ALL: [Self; 4] = [Self::Local, Self::Apple, Self::Immich, Self::Nextcloud];
+    pub const ALL: [Self; 5] = [Self::Pinal, Self::Local, Self::Apple, Self::Immich, Self::Nextcloud];
     pub fn id(self) -> &'static str {
         match self {
             Self::Local => "local-folder",
             Self::Apple => "apple-photos",
             Self::Immich => "immich",
             Self::Nextcloud => "nextcloud",
+            Self::Pinal => "pinal-photos",
         }
     }
     pub fn name(self) -> &'static str {
@@ -50,6 +58,7 @@ impl ProviderKind {
             Self::Apple => "Apple Photos",
             Self::Immich => "Immich",
             Self::Nextcloud => "Nextcloud",
+            Self::Pinal => "Pinal Photos",
         }
     }
     pub fn detail(self) -> &'static str {
@@ -58,6 +67,7 @@ impl ProviderKind {
             Self::Apple => "macOS photo library",
             Self::Immich => "Your photo server",
             Self::Nextcloud => "Connect with WebDAV",
+            Self::Pinal => "Sign in with Pinal",
         }
     }
     pub fn of(source: &Source) -> Self {
@@ -68,8 +78,10 @@ impl ProviderKind {
     }
     pub fn available(self) -> bool {
         match self {
-            Self::Local => true,
+            Self::Local => cfg!(not(target_family = "wasm")),
             Self::Apple => cfg!(all(target_os = "macos", feature = "apple-photos")),
+            // In the browser, the signed-in account's library.
+            Self::Pinal => cfg!(feature = "remote") || cfg!(target_family = "wasm"),
             _ => cfg!(feature = "remote"),
         }
     }
@@ -87,7 +99,7 @@ pub struct Connection {
 impl Connection {
     pub fn validate(&self) -> Result<url::Url> {
         ensure!(
-            matches!(self.provider.as_str(), "immich" | "nextcloud"),
+            matches!(self.provider.as_str(), "immich" | "nextcloud" | "pinal-photos"),
             "Unknown provider"
         );
         let mut url = url::Url::parse(self.server.trim()).context("Enter a complete server URL")?;
@@ -132,6 +144,9 @@ pub fn connection_label(source: &Source) -> String {
     if source.driver == "apple-photos" {
         return "Apple Photos".into();
     }
+    if source.driver == "pinal-photos" {
+        return "Pinal Photos".into();
+    }
     let config = fs::read(source.path.join("connection.json"))
         .ok()
         .and_then(|s| serde_json::from_slice::<Connection>(&s).ok());
@@ -161,6 +176,12 @@ pub fn account_detail(source: &Source) -> String {
             }
         }
         "apple-photos" => "System Photo Library".into(),
+        // The Pinal account's address.
+        "pinal-photos" => fs::read(source.path.join("connection.json"))
+            .ok()
+            .and_then(|s| serde_json::from_slice::<Connection>(&s).ok())
+            .map(|c| c.username)
+            .unwrap_or_default(),
         _ => fs::read(source.path.join("connection.json"))
             .ok()
             .and_then(|s| serde_json::from_slice::<Connection>(&s).ok())
@@ -181,7 +202,7 @@ pub fn digest(s: &str) -> String {
 /// Disconnect credentials without deleting originals or library annotations.
 pub fn forget_credentials(source: &Source) -> Result<()> {
     #[cfg(feature = "remote")]
-    if matches!(source.driver.as_str(), "immich" | "nextcloud") {
+    if matches!(source.driver.as_str(), "immich" | "nextcloud" | "pinal-photos") {
         match remote::credential(source)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => (),
             Err(error) => return Err(error.into()),
@@ -205,6 +226,19 @@ pub fn open(source: &Source) -> Result<Box<dyn PhotosDriver>> {
                 .get_password()
                 .context("Credentials unavailable. Reconnect this photo source.")?;
             let provider = Box::new(remote::Remote::new(config, &secret)?);
+            Ok(Box::new(ConnectedPhotos::new(source.clone(), provider)?))
+        }
+        #[cfg(target_family = "wasm")]
+        "pinal-photos" => Ok(Box::new(web::WebPinalPhotos::default())),
+        #[cfg(feature = "remote")]
+        "pinal-photos" => {
+            let config: Connection =
+                serde_json::from_slice(&fs::read(source.path.join("connection.json"))?)?;
+            ensure!(config.provider == source.driver, "Connection provider mismatch");
+            let refresh = remote::credential(source)?
+                .get_password()
+                .context("Your Pinal sign-in is unavailable. Remove Pinal Photos and add it again.")?;
+            let provider = Box::new(pinal::PinalPhotos::new(&config, &refresh, Some(source.clone()))?);
             Ok(Box::new(ConnectedPhotos::new(source.clone(), provider)?))
         }
         #[cfg(all(target_os = "macos", feature = "apple-photos"))]

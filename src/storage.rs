@@ -95,13 +95,24 @@ impl Preferences {
             .unwrap_or_default()
             .clamped()
     }
+    #[cfg_attr(target_family = "wasm", allow(unreachable_code))]
     pub fn load(path: &Path) -> Result<Self> {
+        // In the browser, settings live in its storage.
+        #[cfg(target_family = "wasm")]
+        return Ok(crate::web::load(&path.to_string_lossy())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default());
+        #[cfg(not(target_family = "wasm"))]
         if !path.exists() {
             return Ok(Self::default());
         }
         serde_json::from_slice(&fs::read(path)?).context("Cannot read Photos settings.")
     }
+    #[cfg_attr(target_family = "wasm", allow(unreachable_code))]
     pub fn save(&self, path: &Path) -> Result<()> {
+        #[cfg(target_family = "wasm")]
+        return crate::web::store(&path.to_string_lossy(), &serde_json::to_string(self)?);
+        #[cfg(not(target_family = "wasm"))]
         if let Ok(bytes) = fs::read(path)
             && serde_json::from_slice::<Self>(&bytes).is_err()
         {
@@ -369,6 +380,12 @@ pub trait PhotosDriver: Send + Sync {
     fn can_import(&self) -> bool {
         true
     }
+    /// A link that downloads this photo's original, where the library has
+    /// one (the browser's photo source): what dragging it out of the page
+    /// saves.
+    fn download_url(&self, _photo: &Photo) -> Option<String> {
+        None
+    }
     fn refresh_library(&self, _library: Library) -> Result<Library> {
         self.scan()
     }
@@ -453,7 +470,7 @@ pub fn measure_sizes(
         return sizes;
     }
     let mut time = |edge: u32, i: usize| {
-        let started = std::time::Instant::now();
+        let started = web_time::Instant::now();
         driver.sample(samples.get(i)?, edge).ok()?;
         Some(started.elapsed())
     };

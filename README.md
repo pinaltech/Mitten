@@ -20,11 +20,11 @@
 
 <sub>Screenshots use generated sample photos.</sub>
 
-Mitten is a fast, native photo library written in Rust with GPUI. It runs without Electron or a webview, and it browses the photos you already have where they already are, without copying originals. A quiet sidebar, an adaptive image grid, selection controls and a focused viewer take inspiration from Photos on macOS, with light and dark palettes and a choice of accent colors.
+Mitten is a fast, native photo library written in Rust with GPUI (the `gpui-pre` snapshot, as Picacho uses). It runs without Electron or a webview, and it browses the photos you already have where they already are, without copying originals. A quiet sidebar, an adaptive image grid, selection controls and a focused viewer take inspiration from Photos on macOS, with light and dark palettes and a choice of accent colors.
 
 ## Build
 
-Requirements: Rust 1.96 or later. Cargo fetches [DesertUI](https://github.com/pinaltech/DesertUI) automatically; no separate checkout is needed. On macOS, Xcode with its command-line tools; they provide clang and the Photos SDK. Runtime Metal shaders need no extra Metal toolchain download. Server credentials are kept in the system keychain on each platform: macOS Keychain, Windows Credential Manager, or the kernel keyring on Linux.
+Requirements: Rust 1.96 or later. Cargo fetches [DesertUI](https://github.com/pinaltech/DesertUI) itself (its `gpui-pre` branch, until that is merged). On macOS, Xcode with its command-line tools; they provide clang and the Photos SDK. Runtime Metal shaders need no extra Metal toolchain download. Server credentials are kept in the system keychain on each platform: macOS Keychain, Windows Credential Manager, or the kernel keyring on Linux.
 
 Run from source:
 
@@ -52,12 +52,31 @@ Choose a library from the welcome screen, or drop a local folder into the empty 
 
 | Library      | Connection                                                    | Photos                                                         |
 | ------------ | ------------------------------------------------------------- | -------------------------------------------------------------- |
+| Pinal Photos | Sign in with Pinal in your browser                            | Your Pinal library, also at [photos.pinal.tech](https://photos.pinal.tech) |
 | Local folder | Choose an existing folder                                     | Originals stay in place; changes are found every five seconds  |
 | Apple Photos | macOS Photos permission                                       | Read through PhotoKit; albums sync one way                     |
 | Immich       | Server URL and API key                                        | Favorites, descriptions and albums sync both ways              |
 | Nextcloud    | Server URL, username, app password and an optional folder     | Read through WebDAV with Nextcloud's preview service           |
 
 Originals are never rewritten. Favorites, captions, albums and Recently Deleted are stored by Mitten on this device, except in Immich, where they are written to the server.
+
+## Pinal Photos sign-in
+
+Mitten signs in to Pinal as an ordinary public developer app, like Picacho: in
+the browser with PKCE, answered on `http://127.0.0.1/callback`, or for the
+bundled macOS app through `https://accounts.pinal.tech/native/callback`, which
+opens `mitten://`. Its refresh token is kept in the system keyring. Override
+the defaults at build or run time for development:
+
+| Variable | Default |
+| --- | --- |
+| `MITTEN_PINAL_CLIENT_ID` | `pnl_xlabeTOTOtwogPMJ` |
+| `MITTEN_PINAL_ACCOUNTS` | `https://accounts.pinal.tech` |
+| `MITTEN_PINAL_PHOTOS` | `https://photos.pinal.tech` |
+
+## In the browser
+
+Mitten also runs in the browser: compiled to wasm, drawn by GPUI on WebGPU (WebGL 2 where WebGPU is missing), on a library served by the page's own site. See [web/README.md](web/README.md) to build it and embed it in a site. [photos.pinal.tech](https://photos.pinal.tech) is one such site, for anyone signed in to Pinal; its Worker and page live outside this repository.
 
 ## Documentation
 
