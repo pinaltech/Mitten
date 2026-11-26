@@ -9,7 +9,7 @@ autobenches = false
 [features]
 default = ["native-ui", "remote", "apple-photos"]
 native-ui = ["dep:desert-ui", "dep:gpui", "dep:gpui-component", "dep:gpui-platform", "dep:gpui-web", "dep:raw-window-handle"]
-remote = ["dep:reqwest", "dep:reqwest_dav", "dep:tokio", "dep:roxmltree", "dep:keyring"]
+remote = ["dep:reqwest", "dep:reqwest_dav", "dep:tokio", "dep:roxmltree", "dep:keyring", "dep:hpke", "dep:aes-gcm", "dep:hkdf", "dep:hmac", "dep:ed25519-dalek", "dep:getrandom"]
 apple-photos = []
 
 [[bin]]
@@ -43,6 +43,14 @@ reqwest_dav = { version = "=0.3.3", default-features = false, features = ["rustl
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time"], optional = true }
 roxmltree = { version = "0.21", optional = true }
 keyring = { version = "3.6", optional = true }
+# Pinal Photos' zero-access encryption (src/sources/pinal_za.rs): the same
+# formats as Pinal's za.js (HPKE RFC 9180, AES-256-GCM, Ed25519).
+hpke = { version = "0.12", default-features = false, features = ["alloc", "x25519"], optional = true }
+aes-gcm = { version = "0.10", optional = true }
+hkdf = { version = "0.12", optional = true }
+hmac = { version = "0.12", optional = true }
+ed25519-dalek = { version = "2", default-features = false, features = ["std"], optional = true }
+getrandom = { version = "0.3", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 raw-window-handle = { version = "0.6", optional = true }

@@ -1385,19 +1385,24 @@ impl MittenApp {
                         return;
                     }
                 };
-                let _ = this.update(cx, |_, cx| cx.open_url(sign_in.url.as_str()));
+                let code = sign_in.confirmation();
+                let _ = this.update(cx, |this, cx| {
+                    // Pinal's consent screen shows the same code beside the keys it hands over.
+                    this.notice = format!("Signing in to Pinal… Your browser should show {code}.").into();
+                    cx.open_url(sign_in.url.as_str())
+                });
                 let result = cx
                     .background_executor()
                     .offload(move || {
-                        let (refresh, who) = sign_in.finish(&cancel)?;
+                        let (refresh, who, keys) = sign_in.finish(&cancel)?;
                         let config = pinal::connection(&who);
                         let source = config.source(&data)?;
-                        let provider = pinal::PinalPhotos::new(&config, &refresh, Some(source.clone()))?;
+                        let provider = pinal::PinalPhotos::new(&config, &refresh, Some(source.clone()), Some(keys.clone()))?;
                         let driver: Arc<dyn PhotosDriver> = Arc::new(
                             mitten::sources::ConnectedPhotos::new(source, Box::new(provider))?,
                         );
                         let page = driver.page(None)?;
-                        pinal::save(&refresh, &who, &data)?;
+                        pinal::save(&refresh, &who, &keys, &data)?;
                         Ok::<_, anyhow::Error>((driver, page))
                     })
                     .await;
