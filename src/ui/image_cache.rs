@@ -64,7 +64,7 @@ impl PhotoImageCache {
     }
     pub fn ready(&self, path: &std::path::Path) -> Option<Arc<RenderImage>> {
         self.ready
-            .get(&Resource::from(path.to_path_buf()))
+            .get(&crate::ui::image_resource(path))
             .and_then(Weak::upgrade)
     }
     #[cfg(test)]

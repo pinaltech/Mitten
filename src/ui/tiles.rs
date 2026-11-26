@@ -15,7 +15,8 @@ use std::{
 /// Photos per background request: one PhotoKit fetch or one worker's run.
 pub const BATCH: usize = 32;
 /// Decoded squares kept beyond what is on screen.
-const BUDGET: usize = 640 << 20;
+/// A browser tab's memory is far smaller than a desktop app's.
+const BUDGET: usize = if cfg!(target_family = "wasm") { 192 << 20 } else { 640 << 20 };
 /// Most queued requests remembered per frame (the rest are asked again later).
 const QUEUE: usize = 6000;
 /// Decoded ThumbHash placeholders kept (each at most 32×32).
@@ -204,7 +205,7 @@ impl Tiles {
             .collect();
         old.sort_unstable();
         for (_, key) in old {
-            if self.bytes <= BUDGET * 9 / 10 {
+            if self.bytes <= BUDGET / 10 * 9 {
                 break;
             }
             if let Some(entry) = self.entries.remove(&key) {

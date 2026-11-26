@@ -6,3 +6,5 @@ pub mod map;
 pub mod native_image;
 pub mod sources;
 pub mod storage;
+#[cfg(target_family = "wasm")]
+pub mod web;

@@ -7,6 +7,7 @@ pub(super) const INSPECTOR_WIDTH: f32 = 300.;
 /// The map's size in the panel (it is fetched at this many pixels, so the
 /// tiles' labels stay readable).
 const MAP_SIZE: (u32, u32) = (268, 180);
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 const MAP_ZOOM: u8 = 14;
 const FACE_JOBS: usize = 6;
 
@@ -68,7 +69,7 @@ pub(super) fn face(path: Option<PathBuf>, edge: f32, c: Colors) -> Div {
         .items_center()
         .justify_center()
         .child(match path {
-            Some(path) => img(Arc::<std::path::Path>::from(path))
+            Some(path) => img(crate::ui::image_source(&path))
                 .size_full()
                 .object_fit(ObjectFit::Cover)
                 .into_any_element(),
@@ -256,7 +257,7 @@ impl MittenApp {
                         cx.listener(|this, _, w, cx| {
                             this.save_caption(cx);
                             this.inspector = false;
-                            this.focus.focus(w);
+                            this.focus.focus(w, cx);
                             cx.notify();
                         }),
                     )),
@@ -469,7 +470,7 @@ impl MittenApp {
                     .bg(rgb(c.soft))
                     .cursor_pointer()
                     .child(match image {
-                        Some(Some(path)) => img(Arc::<std::path::Path>::from(path))
+                        Some(Some(path)) => img(crate::ui::image_source(&path))
                             .size_full()
                             .object_fit(ObjectFit::Cover)
                             .into_any_element(),

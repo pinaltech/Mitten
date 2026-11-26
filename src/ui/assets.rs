@@ -5,6 +5,7 @@ impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
         let bytes: Option<&'static [u8]> = match path {
             "brand/mitten.svg" => Some(include_bytes!("../../assets/brand/mitten.svg")),
+            "brand/pinal.svg" => Some(include_bytes!("../../assets/brand/pinal.svg")),
             "photo-heart.svg" => Some(include_bytes!("../../assets/photo-heart.svg")),
             "photo-heart-filled.svg" => Some(include_bytes!("../../assets/photo-heart-filled.svg")),
             "providers/immich.svg" => Some(include_bytes!("../../assets/providers/immich.svg")),
