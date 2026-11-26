@@ -20,6 +20,8 @@ pub use apple::verify_configuration as verify_photokit_configuration;
 #[cfg(feature = "remote")]
 pub mod pinal;
 pub mod pinal_api;
+#[cfg(feature = "remote")]
+pub mod pinal_za;
 #[cfg(target_family = "wasm")]
 pub mod web;
 #[cfg(feature = "remote")]
@@ -238,7 +240,7 @@ pub fn open(source: &Source) -> Result<Box<dyn PhotosDriver>> {
             let refresh = remote::credential(source)?
                 .get_password()
                 .context("Your Pinal sign-in is unavailable. Remove Pinal Photos and add it again.")?;
-            let provider = Box::new(pinal::PinalPhotos::new(&config, &refresh, Some(source.clone()))?);
+            let provider = Box::new(pinal::PinalPhotos::new(&config, &refresh, Some(source.clone()), None)?);
             Ok(Box::new(ConnectedPhotos::new(source.clone(), provider)?))
         }
         #[cfg(all(target_os = "macos", feature = "apple-photos"))]

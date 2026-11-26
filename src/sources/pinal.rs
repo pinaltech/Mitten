@@ -7,8 +7,15 @@
 //! (RFC 8252 §7.3), or, for the bundled macOS app, through Pinal's
 //! `/native/callback` page as a `mitten://` URL (§7.1). Pinal
 //! issues access tokens addressed to Pinal Photos (JWTs it verifies) and a
-//! refresh token, which is the only secret kept (in the system keyring).
+//! refresh token, kept in the system keyring.
+//!
+//! Pinal Photos is zero-access storage: Pinal stores only ciphertext. At
+//! sign-in Mitten sends a public key (`zk_pub`) and the person's browser
+//! seals the Photos keys to it (see `pinal_za`); those keys are kept in the
+//! keyring too, and every photo is decrypted here.
 use super::*;
+use super::pinal_za::{self, Folder, Keys};
+use std::collections::HashMap;
 pub use super::pinal_api::parse_page;
 use reqwest::blocking::Client;
 use serde_json::Value;
@@ -144,6 +151,9 @@ pub struct SignIn {
     verifier: String,
     state: String,
     endpoints: Endpoints,
+    /// The X25519 key Pinal seals the Photos keys to (spec §7.5).
+    device: [u8; 32],
+    device_public: [u8; 32],
 }
 impl SignIn {
     pub fn start() -> Result<Self> {
@@ -161,6 +171,7 @@ impl SignIn {
         // `mitten.` tells Pinal's /native/callback page which app to open.
         let state = format!("mitten.{}", random_token());
         let challenge = base64url(&Sha256::digest(verifier.as_bytes()));
+        let (device, device_public) = pinal_za::keypair()?;
         let mut url = endpoints.authorize.clone();
         url.query_pairs_mut().extend_pairs([
             ("client_id", client_id().as_str()),
@@ -171,12 +182,21 @@ impl SignIn {
             ("code_challenge", &challenge),
             ("code_challenge_method", "S256"),
             ("resource", &server()),
+            // Pinal's consent screen seals the Photos keys to this.
+            ("zk_pub", &pinal_za::b64(&device_public)),
         ]);
-        Ok(Self { url, listener, redirect, verifier, state, endpoints })
+        Ok(Self { url, listener, redirect, verifier, state, endpoints, device, device_public })
+    }
+
+    /// Short code Pinal's consent screen shows next to the keys it hands over.
+    pub fn confirmation(&self) -> String {
+        let d = Sha256::digest(self.device_public);
+        let n = ((d[0] as u32) << 16 | (d[1] as u32) << 8 | d[2] as u32) % 1_000_000;
+        format!("{:03} {:03}", n / 1000, n % 1000)
     }
 
     /// Waits up to five minutes for the browser, then redeems the code.
-    pub fn finish(self, cancel: &AtomicBool) -> Result<(String, Who)> {
+    pub fn finish(self, cancel: &AtomicBool) -> Result<(String, Who, Keys)> {
         let code = self.wait(cancel)?;
         let response = http()?
             .post(self.endpoints.token.clone())
@@ -206,7 +226,16 @@ impl SignIn {
             .and_then(|r| r.json().ok())
             .unwrap_or(Value::Null);
         let text = |key: &str| info[key].as_str().unwrap_or_default().to_owned();
-        Ok((refresh, Who { email: text("email"), name: text("name") }))
+        // The Photos keys, sealed to this sign-in's key by the person's browser.
+        let grant: Value = http()?
+            .get(format!("{}/api/keys/grants/{}", accounts(), pinal_za::grant_id(&self.device_public)))
+            .send()
+            .and_then(|r| r.error_for_status())
+            .context("Pinal didn’t hand over your Photos keys. Unlock your data in your Pinal account and try again.")?
+            .json()?;
+        let keys = pinal_za::open_grant(&self.device, &pinal_za::unb64(grant["payload"].as_str().unwrap_or(""))?, &client_id())?;
+        ensure!(info["sub"].as_str().is_none_or(|sub| sub == keys.user), "Pinal handed over keys for another account.");
+        Ok((refresh, Who { email: text("email"), name: text("name") }, keys))
     }
 
     fn wait(&self, cancel: &AtomicBool) -> Result<String> {
@@ -301,15 +330,23 @@ fn token_response(response: reqwest::blocking::Response) -> Result<Value> {
     Ok(value)
 }
 
-/// Saves a signed-in Pinal Photos library: its connection (no secrets) and
-/// the refresh token in the system keyring.
-pub fn save(refresh: &str, who: &Who, data: &Path) -> Result<Source> {
+/// The keyring entry for a Pinal Photos library's keys (beside its refresh token).
+fn keys_credential(source: &Source) -> Result<keyring::Entry> {
+    Ok(keyring::Entry::new("tech.pinal.mitten", &format!("{}:za", digest(&source.path.to_string_lossy())))?)
+}
+
+/// Saves a signed-in Pinal Photos library: its connection (no secrets), and
+/// the refresh token and Photos keys in the system keyring.
+pub fn save(refresh: &str, who: &Who, keys: &Keys, data: &Path) -> Result<Source> {
     let config = connection(who);
     let source = config.source(data)?;
     fs::create_dir_all(&source.path)?;
     remote::credential(&source)?
         .set_password(refresh)
         .context("Cannot save your Pinal sign-in in the system keyring")?;
+    keys_credential(&source)?
+        .set_password(&serde_json::to_string(keys)?)
+        .context("Cannot save your Pinal Photos keys in the system keyring")?;
     let temp = tempfile::NamedTempFile::new_in(&source.path)?;
     serde_json::to_writer(temp.as_file(), &config)?;
     temp.persist(source.path.join("connection.json")).map_err(|e| e.error)?;
@@ -329,23 +366,113 @@ struct Token {
     expires: Instant,
 }
 
+/// An encrypted photo, opened: its content key and details.
+#[derive(Clone)]
+struct Opened {
+    key: [u8; 32],
+    meta: Value,
+}
+
 pub struct PinalPhotos {
     base: Url,
     http: Client,
     source: Option<Source>,
     refresh: Mutex<String>,
     token: Mutex<Option<Token>>,
+    keys: Option<Keys>,
+    folders: Mutex<HashMap<u64, Folder>>,
+    opened: Mutex<HashMap<String, Opened>>,
 }
+
+const REKEY: &str = "Pinal Photos’ keys changed (a device was removed or the storage mode changed). Remove Pinal Photos and add it again.";
+
 impl PinalPhotos {
-    /// `source` is where a rotated refresh token is saved (None while connecting).
-    pub fn new(config: &Connection, refresh: &str, source: Option<Source>) -> Result<Self> {
+    /// `source` is where a rotated refresh token is saved (None while
+    /// connecting); `keys` are the Photos keys (else read from the keyring).
+    pub fn new(config: &Connection, refresh: &str, source: Option<Source>, keys: Option<Keys>) -> Result<Self> {
+        let keys = keys.or_else(|| {
+            let saved = keys_credential(source.as_ref()?).ok()?.get_password().ok()?;
+            serde_json::from_str(&saved).ok()
+        });
         Ok(Self {
             base: config.validate()?,
             http: http()?,
             source,
             refresh: Mutex::new(refresh.to_owned()),
             token: Mutex::new(None),
+            keys,
+            folders: Mutex::new(HashMap::new()),
+            opened: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn keys(&self) -> Result<&Keys> {
+        self.keys
+            .as_ref()
+            .context("Pinal Photos now encrypts your library. Remove Pinal Photos and add it again to get your keys.")
+    }
+
+    /// The folder key a photo was sealed to (records come from Pinal Photos, checked here).
+    fn folder(&self, version: u64) -> Result<Folder> {
+        if let Some(f) = self.folders.lock().unwrap().get(&version) {
+            return Ok(f.clone());
+        }
+        let keys = self.keys()?;
+        ensure!(version <= keys.newest(), REKEY);
+        let records: Value = serde_json::from_slice(&read(self.get("api/keys/folders")?, METADATA_LIMIT)?)?;
+        let mut folders = self.folders.lock().unwrap();
+        for record in records["folders"].as_array().into_iter().flatten() {
+            if let Ok(folder) = pinal_za::open_folder(keys, record) {
+                folders.insert(folder.version, folder);
+            }
+        }
+        folders.get(&version).cloned().context(REKEY)
+    }
+
+    /// Opens a listing entry; an encrypted one becomes the plain fields Mitten reads.
+    fn open_entry(&self, item: &Value) -> Result<Value> {
+        if item["za"] != 1 {
+            return Ok(item.clone());
+        }
+        let id = item["id"].as_str().context("Photo without an ID")?;
+        let folder = self.folder(item["fv"].as_u64().unwrap_or(0))?;
+        let key = pinal_za::open_content_key(&folder, &pinal_za::unb64(item["ek"].as_str().unwrap_or(""))?, id)?;
+        let meta = pinal_za::open_meta(&key, id, &pinal_za::unb64(item["meta"].as_str().unwrap_or(""))?)?;
+        self.opened.lock().unwrap().insert(id.to_owned(), Opened { key, meta: meta.clone() });
+        Ok(serde_json::json!({
+            "id": id, "name": meta["name"], "taken": meta["taken"], "width": meta["width"],
+            "height": meta["height"], "size": meta["size"], "type": meta["type"]
+        }))
+    }
+
+    /// An encrypted photo's key and details (from the listing, else asked for).
+    fn opened(&self, id: &str) -> Result<Option<Opened>> {
+        if let Some(o) = self.opened.lock().unwrap().get(id) {
+            return Ok(Some(o.clone()));
+        }
+        let mut item: Value = serde_json::from_slice(&read(self.get(&format!("api/photos/{id}/key"))?, METADATA_LIMIT)?)?;
+        if item["za"] != 1 {
+            return Ok(None);
+        }
+        item["id"] = Value::String(id.to_owned());
+        self.open_entry(&item)?;
+        Ok(self.opened.lock().unwrap().get(id).cloned())
+    }
+
+    /// A photo file (`original` or `thumb`), decrypted when it is encrypted.
+    fn fetch(&self, id: &str, thumb: bool, limit: u64) -> Result<Vec<u8>> {
+        let path = if thumb { format!("api/photos/{id}/thumb") } else { format!("api/photos/{id}") };
+        let opened = self.opened(id)?;
+        let response = match self.get(&path) {
+            // An encrypted photo without a thumbnail: its original stands in.
+            Err(_) if thumb && opened.is_some() => return self.fetch(id, false, limit),
+            r => r?,
+        };
+        let bytes = read(response, limit)?;
+        match opened {
+            Some(o) if bytes.starts_with(b"PZA1") => pinal_za::decrypt_file(&o.key, if thumb { "thumb" } else { "original" }, &bytes),
+            _ => Ok(bytes),
+        }
     }
 
     /// A current access token, renewed at Pinal a minute before it expires.
@@ -423,7 +550,14 @@ impl Provider for PinalPhotos {
             path.push_str("&cursor=");
             path.extend(url::form_urlencoded::byte_serialize(c.as_bytes()));
         }
-        parse_page(&read(self.get(&path)?, METADATA_LIMIT)?)
+        let mut page: Value = serde_json::from_slice(&read(self.get(&path)?, METADATA_LIMIT)?)
+            .context("Pinal Photos sent an unreadable library")?;
+        if let Some(items) = page["photos"].as_array_mut() {
+            for item in items.iter_mut() {
+                *item = self.open_entry(item)?;
+            }
+        }
+        parse_page(&serde_json::to_vec(&page)?)
     }
     fn image(&self, photo: &Photo, preview: bool, destination: &Path) -> Result<()> {
         self.image_at(photo, if preview { 2560 } else { 512 }, destination)
@@ -435,17 +569,25 @@ impl Provider for PinalPhotos {
     fn image_at(&self, photo: &Photo, edge: u32, destination: &Path) -> Result<()> {
         let id = Self::valid(&photo.id)?;
         // Videos are only drawn from their thumbnail (a frame the uploader took).
-        let path = if edge <= 512 || photo.duration.is_some() {
-            format!("api/photos/{id}/thumb")
-        } else {
-            format!("api/photos/{id}")
-        };
-        fs::write(destination, read(self.get(&path)?, IMAGE_LIMIT)?)?;
+        let thumb = edge <= 512 || photo.duration.is_some();
+        fs::write(destination, self.fetch(id, thumb, IMAGE_LIMIT)?)?;
         Ok(())
     }
     fn video(&self, photo: &Photo) -> Option<VideoSource> {
         photo.duration?;
         let id = Self::valid(&photo.id).ok()?;
+        // Encrypted: decrypted here into a private temporary file, since a
+        // stream from Pinal is ciphertext.
+        if self.opened(id).ok().flatten().is_some() {
+            let dir = std::env::temp_dir().join("mitten-pinal-photos");
+            fs::create_dir_all(&dir).ok()?;
+            let ext = Path::new(&photo.name).extension().and_then(|e| e.to_str()).unwrap_or("mp4");
+            let file = dir.join(format!("{id}.{ext}"));
+            if !file.exists() {
+                fs::write(&file, self.fetch(id, false, 4 * IMAGE_LIMIT).ok()?).ok()?;
+            }
+            return Some(VideoSource::File(file));
+        }
         Some(VideoSource::Remote {
             url: self.base.join(&format!("api/photos/{id}")).ok()?.to_string(),
             headers: vec![("Authorization".into(), format!("Bearer {}", self.access().ok()?))],
@@ -459,6 +601,12 @@ impl Provider for PinalPhotos {
     }
     fn original(&self, id: &str, destination: &Path) -> Result<String> {
         let id = Self::valid(id)?;
+        if let Some(o) = self.opened(id)? {
+            fs::write(destination, self.fetch(id, false, 4 * IMAGE_LIMIT)?)?;
+            let name = o.meta["name"].as_str().unwrap_or_default().to_owned();
+            let safe = !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\']) && !name.chars().any(char::is_control);
+            return Ok(if safe { name } else { format!("{id}.jpg") });
+        }
         let mut response = self.get(&format!("api/photos/{id}"))?;
         // `inline; filename*=UTF-8''name.jpg`
         let name = response
@@ -512,6 +660,8 @@ mod tests {
             verifier: random_token(),
             state: "mitten.abc".into(),
             endpoints: Endpoints { authorize: endpoint.clone(), token: endpoint.clone(), userinfo: endpoint },
+            device: [1; 32],
+            device_public: [2; 32],
         };
         opened(vec![
             "picacho://callback?code=nope&state=mitten.abc".into(),
